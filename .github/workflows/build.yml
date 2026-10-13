@@ -1,0 +1,149 @@
+name: InFlex Flutter Build
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'App version, e.g. 4.5.6 (leave empty to use pubspec.yaml)'
+        required: false
+        type: string
+
+# Needed so the release step can create a GitHub Release + attach the APK.
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Version comes from the "version" box when you press Run workflow
+      # (e.g. 4.5.6 or v4.5.6). Empty box (or a PR build) falls back to
+      # the version in pubspec.yaml. The build number (= Android
+      # versionCode) is the run number, so it ALWAYS goes up and updates
+      # install over the old app without you editing anything.
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          V="$(echo "$INPUT_VERSION" | tr -d '[:space:]')"
+          V="${V#v}"
+          if [ -z "$V" ]; then
+            V=$(grep '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d'+' -f1)
+          fi
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid version '$V' - use the form 4.5.6"
+            exit 1
+          fi
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Building InFlex v$V (build ${{ github.run_number }})"
+
+      # libtorrent is compiled from source once per ABI (arm32 + arm64),
+      # which is heavy on disk. These preinstalled toolchains are not
+      # needed for a Flutter build, so remove them first. (The Android
+      # SDK is deliberately NOT touched.)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter Version Info
+        run: flutter --version
+
+      # This clears stale outputs and forces a re-fetch of dependencies
+      - name: Deep Clean and Purge Cache
+        run: |
+          flutter clean
+          rm -f pubspec.lock
+
+      - name: Install Dependencies
+        run: |
+          flutter pub get
+          flutter pub upgrade intorrent
+
+      - name: Run Build Runner
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      # Overwrites android/app/src/main/res/mipmap-*/ic_launcher.png
+      # from assets/logo.png before the APK is built, every run.
+      - name: Generate app icons
+        run: dart run flutter_launcher_icons
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: true
+
+      # ONE universal APK containing arm64-v8a + armeabi-v7a (arm32).
+      #  - arm64  -> Vivo S1, Galaxy M31, most modern phones
+      #  - arm32  -> 32-bit ROMs like the Galaxy M01
+      # No --split-per-abi, so users only ever see ONE file and can't
+      # pick the wrong one. x86_64 is intentionally excluded (emulators
+      # only), which keeps the APK smaller and the build faster.
+      # Not splitting also means only one Gradle variant runs, so the
+      # old parallel resource-merge race doesn't apply.
+      - name: Build APK (universal arm32 + arm64)
+        run: >
+          flutter build apk --release
+          --target-platform android-arm,android-arm64
+          --build-name=${{ steps.ver.outputs.name }}
+          --build-number=${{ steps.ver.outputs.code }}
+
+      - name: Rename APK
+        id: rename
+        run: |
+          cd build/app/outputs/flutter-apk/
+          VERSION="${{ steps.ver.outputs.name }}"
+          mv app-release.apk InFlex-v${VERSION}.apk
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          ls -lh *.apk
+
+      # Sanity check: fail the build if either ABI is missing, so a
+      # "App not installed" APK can never get published.
+      - name: Verify APK contains arm32 + arm64 libs
+        run: |
+          APK=build/app/outputs/flutter-apk/InFlex-v${{ steps.rename.outputs.version }}.apk
+          unzip -l "$APK" | grep -E "lib/(arm64-v8a|armeabi-v7a)/libintorrent.so"
+          unzip -l "$APK" | grep -q "lib/arm64-v8a/libflutter.so"
+          unzip -l "$APK" | grep -q "lib/armeabi-v7a/libflutter.so"
+
+      # Backup: always available from the Actions page (GitHub zips these).
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InFlex-APK
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 30
+
+      # Direct-download APK for users: no zip, just tap and install.
+      # Runs only on manual runs, so PR builds don't spam releases.
+      # Re-running with the same version overwrites that release's APK.
+      - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.rename.outputs.version }}
+          name: InFlex v${{ steps.rename.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: build/app/outputs/flutter-apk/InFlex-v${{ steps.rename.outputs.version }}.apk
+          make_latest: true
