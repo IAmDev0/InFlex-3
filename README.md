@@ -1,5 +1,7 @@
 # InFlex
-[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/zsdev07/InFlex-2.git)
+<p align="center">
+  <img src="assets/logo.png" alt="LogoHere" width="200">
+</p>
 
 InFlex is a Flutter-based Android app for watching movies and TV shows, with a special focus on Hindi and dubbed content. It finds streams through Torrentio and plays them directly on your device through a built-in torrent engine, so no server is needed for playback.
 
