@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../models/media_model.dart';
@@ -7,15 +8,13 @@ import '../services/stream_service.dart';
 import '../services/subtitle_service.dart';
 import '../services/app_settings.dart';
 import '../services/watch_history.dart';
-import '../services/supabase_cache_repo.dart';
-import '../services/torrent_engine.dart' show StreamFileHint;
+import '../services/torrent_engine.dart' show StreamFileHint, TorrentEngine;
 import '../screens/player_screen.dart';
 import '../screens/torrent_loading_screen.dart';
 
 /// ── StreamBottomSheet ─────────────────────────────────────────────────────
 ///
-/// Fetches torrent streams via Torrentio (StreamService), then cross-checks
-/// Supabase to see which ones are already cached on Telegram.
+/// Fetches torrent streams via Torrentio (StreamService).
 ///
 /// What each source card now tells you (the old cards all just said
 /// "Torrentio"):
@@ -26,15 +25,13 @@ import '../screens/torrent_loading_screen.dart';
 ///   • size, seed health (colour coded) and the indexer
 ///
 /// Filter by language and quality, and sort by best match / quality / seeds /
-/// size. Cached streams stay pinned on top with the golden style.
+/// size.
 ///
 /// On selection:
-///   • Cached torrent  → PlayerScreen directly (stream URL from stream bot)
 ///   • Torrent         → TorrentLoadingScreen (P2P), told exactly WHICH file
 ///                       to play (fixes season packs playing the wrong episode)
 ///   • Embed sources   → PlayerScreen (WebView)
 
-const String _streamBotHost = 'https://streambothost.onrender.com';
 const Color _gold = Color(0xFFFFCC00);
 
 enum _SortMode { best, quality, seeds, size }
@@ -70,8 +67,6 @@ class StreamBottomSheet extends StatefulWidget {
 
 class _StreamBottomSheetState extends State<StreamBottomSheet> {
   List<TorrentStream> _streams = [];
-  // quality → CacheRow for all cached entries for this movie
-  Map<String, CacheRow> _cachedMap = {};
   bool _loading = true;
   String? _error;
   String? _imdbId;
@@ -117,7 +112,6 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
     setState(() {
       _loading = true;
       _error = null;
-      _cachedMap = {};
     });
 
     try {
@@ -140,74 +134,44 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
         return;
       }
 
-      // ── 2. Fetch streams + Supabase cache in parallel ───────────────────
-      final results = await Future.wait([
-        StreamService.getAllStreams(
-          tmdbId: widget.item.id,
-          imdbId: imdbId,
-          type: widget.item.mediaType,
-          season: widget.season,
-          episode: widget.episode,
-          movieTitle: widget.item.title,
-        ),
-        _fetchAllCachedRows(imdbId),
-      ]);
-
-      final streams = results[0] as List<TorrentStream>;
-      final cachedRows = results[1] as List<CacheRow>;
-
-      // Build quality → CacheRow map (only fully cached rows with file_id)
-      final Map<String, CacheRow> cachedMap = {};
-      for (final row in cachedRows) {
-        if (row.isCached) {
-          cachedMap[row.quality.toLowerCase()] = row;
-        }
-      }
+      // ── 2. Fetch streams ────────────────────────────────────────────────
+      final streams = await StreamService.getAllStreams(
+        tmdbId: widget.item.id,
+        imdbId: imdbId,
+        type: widget.item.mediaType,
+        season: widget.season,
+        episode: widget.episode,
+        movieTitle: widget.item.title,
+      );
 
       setState(() {
         _streams = streams;
-        _cachedMap = cachedMap;
         _loading = false;
         if (streams.isEmpty) {
           _error =
               'No streams found for this title.\nIt may not be available yet.';
         }
       });
+
+      // Pre-warm the two best-ranked healthy torrents: their metadata is
+      // fetched while the person is still choosing (see TorrentEngine.prewarm).
+      final candidates = _applyFilters(streams)
+          .where((s) =>
+              !s.isEmbed &&
+              s.magnetLink != null &&
+              (s.seeds ?? 0) >= 20)
+          .take(2)
+          .map((s) => s.magnetLink!)
+          .toList();
+      if (candidates.isNotEmpty) {
+        unawaited(TorrentEngine().prewarm(candidates));
+      }
     } catch (e) {
       setState(() {
         _error = 'Error fetching streams: $e';
         _loading = false;
       });
     }
-  }
-
-  /// Fetch ALL cached rows for this imdb_id (any quality)
-  Future<List<CacheRow>> _fetchAllCachedRows(String imdbId) async {
-    try {
-      return await SupabaseCacheRepo.findAllByImdbId(imdbId);
-    } catch (e) {
-      debugPrint('[InFlex] Cache lookup error: $e');
-      return [];
-    }
-  }
-
-  /// Check if a torrent stream has a matching cached row in Supabase
-  CacheRow? _getCacheRow(TorrentStream stream) {
-    final sq = stream.quality.toLowerCase();
-    // Match by quality string (partial)
-    for (final entry in _cachedMap.entries) {
-      if (sq.contains(entry.key) || entry.key.contains(sq)) {
-        return entry.value;
-      }
-    }
-    // Match by infoHash as fallback
-    for (final row in _cachedMap.values) {
-      if (row.infoHash.isNotEmpty &&
-          row.infoHash.toLowerCase() == stream.infoHash.toLowerCase()) {
-        return row;
-      }
-    }
-    return null;
   }
 
   // ── Language / quality helpers ────────────────────────────────────────────
@@ -348,11 +312,11 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
     return widget.item.title;
   }
 
-  Future<void> _onTapStream(TorrentStream stream, {CacheRow? cacheRow}) async {
+  Future<void> _onTapStream(TorrentStream stream) async {
     // A source with almost no seeders usually never loads (that was the
     // "52 seeds" failure) - say so before the user waits on it.
     final seeds = stream.seeds;
-    if (cacheRow == null && !stream.isEmbed && seeds != null && seeds < 20) {
+    if (!stream.isEmbed && seeds != null && seeds < 20) {
       final go = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -380,28 +344,11 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
       );
       if (go != true || !mounted) return;
     }
-    _selectStream(stream, cacheRow: cacheRow);
+    _selectStream(stream);
   }
 
-  void _selectStream(TorrentStream stream, {CacheRow? cacheRow}) {
+  void _selectStream(TorrentStream stream) {
     Navigator.pop(context);
-
-    // ── Cached: stream directly from Telegram via stream bot ────────────
-    if (cacheRow != null && cacheRow.isCached) {
-      final streamUrl = '$_streamBotHost/stream/doc/${cacheRow.fileId}';
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => PlayerScreen(
-            streamUrl: streamUrl,
-            title: widget.item.title,
-            subtitle: '${stream.quality} · Cached',
-            isEmbed: false,
-          ),
-        ),
-      );
-      return;
-    }
 
     // ── Embed / WebView ──────────────────────────────────────────────────
     if (stream.isEmbed) {
@@ -677,9 +624,7 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
     final embedStreams = _streams.where((s) => s.isEmbed).toList();
 
     final filtered = _applyFilters(baseTorrents);
-    final cachedStreams =
-        filtered.where((s) => _getCacheRow(s) != null).toList();
-    final p2pStreams = filtered.where((s) => _getCacheRow(s) == null).toList();
+    final p2pStreams = filtered;
 
     final isPackFallback =
         baseTorrents.isNotEmpty && baseTorrents.every((s) => s.isPackFallback);
@@ -701,23 +646,6 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
                   });
                 }),
 
-              // ── Cached section (golden, pinned top) ────────────────────
-              if (cachedStreams.isNotEmpty) ...[
-                const _SectionHeader(
-                  icon: Icons.bolt_rounded,
-                  label: 'CACHED ON TELEGRAM',
-                  color: _gold,
-                  subtitle: 'Ready · Instant Stream',
-                ),
-                ...cachedStreams.map((s) => _StreamTile(
-                      stream: s,
-                      cacheRow: _getCacheRow(s),
-                      langTags: _tagsFor(s),
-                      onTap: () =>
-                          _onTapStream(s, cacheRow: _getCacheRow(s)),
-                    )),
-              ],
-
               // ── Peer-to-peer torrent sources ────────────────────────────
               if (p2pStreams.isNotEmpty) ...[
                 const _SectionHeader(
@@ -728,7 +656,6 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
                 ),
                 ...p2pStreams.map((s) => _StreamTile(
                       stream: s,
-                      cacheRow: null,
                       langTags: _tagsFor(s),
                       onTap: () => _onTapStream(s),
                     )),
@@ -744,7 +671,6 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
                 ),
                 ...embedStreams.map((s) => _StreamTile(
                       stream: s,
-                      cacheRow: null,
                       langTags: const [],
                       onTap: () => _onTapStream(s),
                     )),
@@ -1022,22 +948,18 @@ class _SectionHeader extends StatelessWidget {
 
 class _StreamTile extends StatelessWidget {
   final TorrentStream stream;
-  final CacheRow? cacheRow;
   final List<_LangTag> langTags;
   final VoidCallback onTap;
 
   const _StreamTile({
     required this.stream,
-    required this.cacheRow,
     required this.langTags,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final isCached = cacheRow != null;
-    final qualColor =
-        isCached ? 0xFFFFCC00 : StreamService.qualityColor(stream.quality);
+    final qualColor = StreamService.qualityColor(stream.quality);
 
     // Small grey technical chips: BluRay · HEVC · HDR · Atmos
     final tech = <String>[
@@ -1057,15 +979,11 @@ class _StreamTile extends StatelessWidget {
         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          color: isCached
-              ? _gold.withValues(alpha: 0.06)
-              : Colors.white.withValues(alpha: 0.04),
+          color: Colors.white.withValues(alpha: 0.04),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: isCached
-                ? _gold.withValues(alpha: 0.35)
-                : Colors.white.withValues(alpha: 0.06),
-            width: isCached ? 1.5 : 1,
+            color: Colors.white.withValues(alpha: 0.06),
+            width: 1,
           ),
         ),
         child: Row(
@@ -1110,25 +1028,6 @@ class _StreamTile extends StatelessWidget {
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
-                      if (isCached) ...[
-                        const SizedBox(width: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: _gold.withValues(alpha: 0.15),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text(
-                            '⚡ CACHED',
-                            style: TextStyle(
-                                color: _gold,
-                                fontSize: 9,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 0.8),
-                          ),
-                        ),
-                      ],
                     ],
                   ),
 
@@ -1174,7 +1073,7 @@ class _StreamTile extends StatelessWidget {
                   ],
 
                   const SizedBox(height: 6),
-                  _buildMetaRow(isCached),
+                  _buildMetaRow(),
                 ],
               ),
             ),
@@ -1184,7 +1083,7 @@ class _StreamTile extends StatelessWidget {
               padding: const EdgeInsets.only(top: 2),
               child: Icon(
                 Icons.play_circle_rounded,
-                color: isCached ? _gold : Colors.white24,
+                color: Colors.white24,
                 size: 22,
               ),
             ),
@@ -1194,37 +1093,7 @@ class _StreamTile extends StatelessWidget {
     );
   }
 
-  Widget _buildMetaRow(bool isCached) {
-    if (isCached) {
-      return Row(
-        children: [
-          const Text('Torrentio Cached',
-              style: TextStyle(
-                  color: Color(0xB3FFCC00),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600)),
-          const SizedBox(width: 10),
-          if (cacheRow!.fileSizeBytes != null) ...[
-            const Icon(Icons.storage_rounded,
-                color: Colors.white30, size: 11),
-            const SizedBox(width: 3),
-            Text(
-              _formatSize(cacheRow!.fileSizeBytes!),
-              style: const TextStyle(color: Colors.white38, fontSize: 11),
-            ),
-            const SizedBox(width: 10),
-          ],
-          const Icon(Icons.play_circle_rounded, color: _gold, size: 11),
-          const SizedBox(width: 3),
-          const Text(
-            'Instant Stream',
-            style: TextStyle(
-                color: _gold, fontSize: 11, fontWeight: FontWeight.w600),
-          ),
-        ],
-      );
-    }
-
+  Widget _buildMetaRow() {
     final health = seedHealthFor(stream.seeds);
     final (Color healthColor, String healthLabel) = switch (health) {
       SeedHealth.strong => (const Color(0xFF22C55E), 'Strong'),
@@ -1280,13 +1149,6 @@ class _StreamTile extends StatelessWidget {
               style: const TextStyle(color: Colors.white38, fontSize: 11)),
       ],
     );
-  }
-
-  String _formatSize(int bytes) {
-    if (bytes >= 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-    }
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(0)} MB';
   }
 }
 
