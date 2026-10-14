@@ -262,6 +262,38 @@ class TorrentEngine {
   static const Duration _maxPreBufferWait = Duration(seconds: 45);
   bool _gatePassed = false;
   int _preBufferTarget = 0;
+
+  // ── Adaptive gate (default, non-smart mode) ────────────────────────────────
+  // The old fixed target (0.5% of the file) made a FAST swarm wait for ~30 MiB
+  // it didn't need and gave a SLOW one no extra cushion. Now the target is
+  // ~8 s of video at the file's average bitrate, scaled up to 4x when the
+  // measured download speed is below that bitrate (clamped 8-48 MiB).
+  // The player's duration isn't known yet at this point, so the runtime is
+  // assumed (episode ~50 min, movie ~110 min) - only used for this estimate.
+  static const int _adaptiveMaxBytes = 48 * 1024 * 1024;
+  static const Duration _borderlineMaxPreBufferWait = Duration(seconds: 75);
+  double _speedEmaBps = 0; // smoothed download speed, bytes/s
+
+  double get _assumedBitrateBps {
+    if (_fileSize <= 0) return 0;
+    final isEpisode = _fileHint?.season != null || _fileHint?.episode != null;
+    final runtimeSec = isEpisode ? 50 * 60 : 110 * 60;
+    return _fileSize / runtimeSec;
+  }
+
+  int _adaptiveTarget() {
+    final bitrate = _assumedBitrateBps;
+    if (bitrate <= 0) return _preBufferTarget;
+    var factor = 2.0; // speed not measured yet
+    if (_speedEmaBps > 0) {
+      factor = (bitrate / _speedEmaBps).clamp(1.0, 4.0).toDouble();
+    }
+    var t = (bitrate * 8 * factor).round();
+    if (t < _minPreBufferBytes) t = _minPreBufferBytes;
+    if (t > _adaptiveMaxBytes) t = _adaptiveMaxBytes;
+    if (_fileSize > 0 && t > _fileSize) t = _fileSize;
+    return t;
+  }
   DateTime? _streamStartedAt;
 
   // ── Smart pre-buffer (experimental setting, default OFF) ───────────────────
@@ -325,6 +357,7 @@ class TorrentEngine {
     _fileHint = fileHint;
     _smartPreBuffer = smartPreBuffer;
     _forcePlay = false;
+    _speedEmaBps = 0;
     _lastHead = 0;
     _lastHeadAt = DateTime.now();
     _emit(const TorrentState(
@@ -581,6 +614,10 @@ class TorrentEngine {
     }
     _lastDownloadedBytes = status.downloadedBytes;
     _lastPollTime = now;
+    if (speedMbs > 0) {
+      final bps = speedMbs * 1024 * 1024;
+      _speedEmaBps = _speedEmaBps == 0 ? bps : (_speedEmaBps * 0.6 + bps * 0.4);
+    }
 
     // Once real metadata is in (state has moved past
     // downloadingMetadata/queued/checking), kick off streaming - guarded
@@ -613,6 +650,7 @@ class TorrentEngine {
     // a real progress bar) until the head of the file is contiguously
     // downloaded - or _maxPreBufferWait has passed.
     if (!_gatePassed) {
+      if (!_smartPreBuffer) _preBufferTarget = _adaptiveTarget();
       var head = 0;
       try {
         head = await intorrent.availableBytes(
@@ -637,16 +675,22 @@ class TorrentEngine {
                 waited > _smartAbsoluteMaxWait);
       } else {
         // Default: full target, or give up after _maxPreBufferWait.
-        pass = _forcePlay ||
-            head >= _preBufferTarget ||
-            waited > _maxPreBufferWait;
+        // A borderline swarm (sustains at least half the bitrate) gets a
+        // little longer before we give up and start anyway.
+        final maxWait = _speedEmaBps >= _assumedBitrateBps * 0.5
+            ? _borderlineMaxPreBufferWait
+            : _maxPreBufferWait;
+        pass = _forcePlay || head >= _preBufferTarget || waited > maxWait;
       }
 
       if (pass) {
         _gatePassed = true;
         debugPrint('[TorrentEngine] pre-buffer done: '
             '${(head / (1024 * 1024)).toStringAsFixed(1)} MiB '
-            'after ${waited.inSeconds}s'
+            'after ${waited.inSeconds}s '
+            '(target ${(_preBufferTarget / (1024 * 1024)).toStringAsFixed(1)} MiB, '
+            'speed ${(_speedEmaBps / (1024 * 1024)).toStringAsFixed(2)} MB/s, '
+            'bitrate ~${(_assumedBitrateBps / (1024 * 1024)).toStringAsFixed(2)} MB/s)'
             '${_smartPreBuffer ? " (smart)" : ""}'
             '${_forcePlay ? " (forced)" : ""}');
       } else {
