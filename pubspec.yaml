@@ -24,7 +24,7 @@ dependencies:
   # exist in the updated InTorrent - push that repo BEFORE building this one.
   intorrent:
     git:
-      url: https://github.com/zdev07/InTorrent-2.git
+      url: https://github.com/IAmDev0/InTorrent-3.git
 
   # ── Video Player (replaces video_player + chewie) ─────────────────────────
   # Native media engine. Handles HEVC/H.265, MKV, HDR out of the box.
