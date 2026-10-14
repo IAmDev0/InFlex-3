@@ -7,6 +7,7 @@ import 'providers/tmdb_provider.dart';
 import 'providers/watchlist_provider.dart';
 import 'screens/splash_screen.dart';
 import 'package:media_kit/media_kit.dart';
+import 'services/tracker_list.dart';
 
 // ── Replace these before deploying ────────────────────────────────────────────
 const _supabaseUrl = 'https://dmiqpgmvutcameekywul.supabase.co';
@@ -49,7 +50,8 @@ void main() async {
       await Hive.openBox('watch_history');
     } catch (_) {}
   }
-
+  
+  unawaited(TrackerList.refresh());
   runApp(const InFlexApp());
 }
 
