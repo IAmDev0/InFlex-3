@@ -59,11 +59,9 @@ import 'package:intorrent/intorrent.dart' as intorrent;
 //   • No save-path management needed here at all - InTorrent handles its
 //     own temp directory (and cleans it up on remove()) internally. The
 //     old _saveDir/_cleanupSaveDir/path_provider dependency is gone.
-//   • No external tracker-list fetching (TrackerManager.fetchBestTrackers())
-//     - InTorrent's DHT alone has tested reliably (real peers/seeds within
-//     seconds on a plain magnet + one tracker) once its Android networking
-//     bugs were fixed, so this wasn't reintroduced. Worth revisiting only
-//     if peer discovery turns out to be too slow in practice.
+//   • Tracker list: magnets carry the built-in trackers plus a weekly
+//     refreshed copy of ngosang's list (see tracker_list.dart); DHT does
+//     the rest.
 //
 // Usage (unchanged):
 //   final engine = TorrentEngine();
@@ -347,6 +345,73 @@ class TorrentEngine {
   /// HTTP stream URL — valid when phase == ready or streaming.
   String? get streamUrl => _current.streamUrl;
 
+  // ── Metadata pre-warm ──────────────────────────────────────────────────────
+  // While the person is still choosing a source, the likely ones are added to
+  // InTorrent in upload_mode (metadata only - no pieces, no bandwidth). If
+  // one of them is then picked, start() adopts the already-added torrent and
+  // the slow cold step (finding peers + fetching metadata) is already done.
+  // Unused ones are removed after _prewarmTtl.
+  static const int _maxPrewarm = 2;
+  static const Duration _prewarmTtl = Duration(seconds: 90);
+  final Map<String, int> _prewarmIds = {}; // infohash -> InTorrent id
+  final Map<String, Timer> _prewarmTimers = {};
+
+  static String? _infoHashOf(String magnet) {
+    final m = RegExp(r'btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})')
+        .firstMatch(magnet);
+    return m?.group(1)?.toLowerCase();
+  }
+
+  /// Pre-warm up to [_maxPrewarm] magnets (best candidate first). Anything
+  /// previously pre-warmed that isn't in [magnets] is dropped.
+  Future<void> prewarm(List<String> magnets) async {
+    final wanted = <String, String>{};
+    for (final m in magnets) {
+      final h = _infoHashOf(m);
+      if (h != null && wanted.length < _maxPrewarm) wanted[h] = m;
+    }
+    for (final h in _prewarmIds.keys.toList()) {
+      if (!wanted.containsKey(h)) await _dropPrewarm(h);
+    }
+    for (final e in wanted.entries) {
+      if (_prewarmIds.containsKey(e.key)) continue;
+      try {
+        final id = await intorrent.addMagnet('${e.value}&x.prewarm=1');
+        _prewarmIds[e.key] = id;
+        _prewarmTimers[e.key] = Timer(_prewarmTtl, () => _dropPrewarm(e.key));
+        debugPrint('[TorrentEngine] prewarm started id=$id hash=${e.key}');
+      } catch (err) {
+        debugPrint('[TorrentEngine] prewarm failed: $err');
+      }
+    }
+  }
+
+  Future<void> _dropPrewarm(String hash) async {
+    _prewarmTimers.remove(hash)?.cancel();
+    final id = _prewarmIds.remove(hash);
+    if (id == null) return;
+    try {
+      await intorrent.remove(id);
+    } catch (_) {}
+    debugPrint('[TorrentEngine] prewarm dropped hash=$hash');
+  }
+
+  Future<void> cancelPrewarm() async {
+    for (final h in _prewarmIds.keys.toList()) {
+      await _dropPrewarm(h);
+    }
+  }
+
+  // ── Start-up timeline (for finding out where the time really goes) ─────────
+  Stopwatch? _sw;
+  bool _adopted = false;
+  bool _firstPlayLogged = false;
+
+  void _mark(String what) {
+    debugPrint('[Timeline] $what  t=${_sw?.elapsedMilliseconds ?? -1}ms '
+        '(prewarmed=$_adopted)');
+  }
+
   /// Start a new torrent session. Cancels any prior session first.
   Future<void> start(
     String magnetLink, {
@@ -365,8 +430,21 @@ class TorrentEngine {
       libraryVersion: 'InTorrent (libtorrent 2.1.1)',
     ));
 
+    _sw = Stopwatch()..start();
+    _firstPlayLogged = false;
+    _adopted = false;
     try {
-      final id = await intorrent.addMagnet(magnetLink);
+      final hash = _infoHashOf(magnetLink);
+      final adoptedId = hash == null ? null : _prewarmIds.remove(hash);
+      final int id;
+      if (adoptedId != null) {
+        _prewarmTimers.remove(hash)?.cancel();
+        id = adoptedId;
+        _adopted = true;
+      } else {
+        id = await intorrent.addMagnet(magnetLink);
+      }
+      _mark('torrent added');
       _activeId = id;
       _streamStarted = false;
       _lastDownloadedBytes = null;
@@ -485,6 +563,10 @@ class TorrentEngine {
     _prefetchTimer = null;
 
     if (playing) {
+      if (!_firstPlayLogged) {
+        _firstPlayLogged = true;
+        _mark('first play');
+      }
       _everPlayed = true;
       unawaited(_cancelPrefetch());
       return;
@@ -628,6 +710,7 @@ class TorrentEngine {
 
     if (!_streamStarted && metadataReady) {
       _metadataTimer?.cancel();
+      _mark('metadata ready (peers=${status.numPeers})');
       await _startStream(id);
     }
 
@@ -685,6 +768,7 @@ class TorrentEngine {
 
       if (pass) {
         _gatePassed = true;
+        _mark('pre-buffer gate passed');
         debugPrint('[TorrentEngine] pre-buffer done: '
             '${(head / (1024 * 1024)).toStringAsFixed(1)} MiB '
             'after ${waited.inSeconds}s '
@@ -800,6 +884,7 @@ class TorrentEngine {
       ));
 
       debugPrint('[TorrentEngine] Stream started → url=$url');
+      _mark('stream prepared (file ${(_fileSize / (1024 * 1024)).toStringAsFixed(0)} MiB)');
     } catch (e) {
       debugPrint('[TorrentEngine] startStream failed: $e');
       _emit(_current.copyWith(
