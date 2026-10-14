@@ -3,18 +3,19 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/media_model.dart';
 import 'release_parser.dart';
+import 'tracker_list.dart';
 
 /// ── StreamService ─────────────────────────────────────────────────────────
 ///
 /// Fetches candidate streams from Torrentio and a small set of reliable
-/// embed fallbacks. Each non-embed TorrentStream now carries a magnetLink
-/// so DebridResolverScreen can forward it straight to the debrid bot.
+/// embed fallbacks. Each non-embed TorrentStream carries a magnetLink
+/// that the P2P engine (InTorrent) plays directly.
 ///
 /// Removed:
 ///   • Dead/unreliable embed sources (NontonGo, SmashyStream, 2Embed,
 ///     AutoEmbed, SuperEmbed) — reduced embed list to 3 proven sources.
 ///   • torrentio_service.dart duplicate — call getAllStreams() directly.
-///   • inflex_resolver_service.dart — replaced by debrid_service.dart.
+///   • debrid / Telegram-cache resolvers — the app is P2P-only now.
 
 class StreamService {
   static final _client = http.Client();
@@ -105,14 +106,14 @@ class StreamService {
       all.addAll(packs);
     }
 
-    // Debrid sources first (best quality), then embeds
+    // Torrent sources first (best quality), then embeds
     all.sort((a, b) {
       if (a.isEmbed != b.isEmbed) return a.isEmbed ? 1 : -1;
       return _priority(b.quality).compareTo(_priority(a.quality));
     });
 
     debugPrint('[StreamService] Total streams: ${all.length} '
-        '(${all.where((s) => !s.isEmbed).length} debrid, '
+        '(${all.where((s) => !s.isEmbed).length} torrent, '
         '${all.where((s) => s.isEmbed).length} embed)');
     return all;
   }
@@ -232,7 +233,7 @@ class StreamService {
           movieTitle: movieTitle,
         );
 
-        // Build magnet URI — used by DebridResolverScreen and the P2P engine
+        // Build magnet URI — used by the P2P engine
         final magnet = _buildMagnet(infoHash, title: releaseTitle);
 
         result.add(TorrentStream(
@@ -243,7 +244,7 @@ class StreamService {
           size: size,
           sizeBytes: parseSizeToBytes(size),
           seeds: seeds,
-          // streamUrl kept for reference; actual play goes via Telegram
+          // streamUrl kept for reference; actual play goes via the P2P engine
           streamUrl:
               'https://torrentio.strem.fun/$infoHash/${fileIdx ?? 0}/download.mp4',
           source: 'Torrentio',
@@ -332,7 +333,7 @@ class StreamService {
 
   // ── MAGNET BUILDER ─────────────────────────────────────────────────────────
   static String _buildMagnet(String infoHash, {String? title}) {
-    final tr = _trackers
+    final tr = TrackerList.merged(_trackers)
         .map((t) => 'tr=${Uri.encodeComponent(t)}')
         .join('&');
     final dn =
