@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../models/media_model.dart';
 import '../services/release_parser.dart';
 import '../services/tmdb_service.dart';
@@ -11,6 +12,8 @@ import '../services/live_seeds.dart';
 import '../services/perf_settings.dart';
 import '../services/watch_history.dart';
 import '../services/torrent_engine.dart' show StreamFileHint, TorrentEngine;
+import '../services/download_service.dart';
+import '../screens/downloads_screen.dart';
 import '../screens/player_screen.dart';
 import '../screens/torrent_loading_screen.dart';
 
@@ -54,6 +57,11 @@ class StreamBottomSheet extends StatefulWidget {
   final String? imdbId;
   final int? season;
   final int? episode;
+  final String? episodeTitle;
+
+  /// When true, opening this sheet puts it straight in permanent-download mode
+  /// with an inline "In-App" vs "In-App + Gallery" selector.
+  final bool downloadMode;
 
   const StreamBottomSheet({
     super.key,
@@ -61,6 +69,8 @@ class StreamBottomSheet extends StatefulWidget {
     this.imdbId,
     this.season,
     this.episode,
+    this.episodeTitle,
+    this.downloadMode = false,
   });
 
   @override
@@ -77,6 +87,7 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
   String? _langFilter; // null = all
   String? _qualityFilter; // null = all
   _SortMode _sort = _SortMode.best;
+  late bool _alsoSaveToGallery = AppSettings.autoSaveToGallery;
 
   // Resume where you left off (Settings > onboarding's default quality also
   // lives here, applied in _qualityScore below).
@@ -167,18 +178,19 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
         }
       });
 
-      // Pre-warm the two best-ranked healthy torrents: their metadata is
-      // fetched while the person is still choosing (see TorrentEngine.prewarm).
-      final candidates = _applyFilters(streams)
-          .where((s) =>
-              !s.isEmbed &&
-              s.magnetLink != null &&
-              (s.seeds ?? 0) >= 20)
-          .take(2)
-          .map((s) => s.magnetLink!)
-          .toList();
-      if (candidates.isNotEmpty) {
-        unawaited(TorrentEngine().prewarm(candidates));
+      // Pre-warm the two best-ranked healthy torrents when streaming.
+      if (!widget.downloadMode) {
+        final candidates = _applyFilters(streams)
+            .where((s) =>
+                !s.isEmbed &&
+                s.magnetLink != null &&
+                (s.seeds ?? 0) >= 20)
+            .take(2)
+            .map((s) => s.magnetLink!)
+            .toList();
+        if (candidates.isNotEmpty) {
+          unawaited(TorrentEngine().prewarm(candidates));
+        }
       }
 
       // Optional real seed counts (off by default): scrape trackers for every
@@ -365,6 +377,10 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
       );
       if (go != true || !mounted) return;
     }
+    if (widget.downloadMode) {
+      await _startDownload(stream, saveToGallery: _alsoSaveToGallery);
+      return;
+    }
     _selectStream(stream);
   }
 
@@ -438,6 +454,128 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
         ),
       ),
     );
+  }
+
+  /// Prompts the user to pick where to save (In-App only vs In-App + Gallery)
+  /// when tapped from normal stream-picker mode, then starts the download.
+  Future<void> _downloadStream(TorrentStream stream) async {
+    final choice = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: const Color(0xFF14141D),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'SAVE PERMANENTLY',
+                style: TextStyle(
+                  color: _gold,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.4,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '$_playbackTitle  ·  ${stream.quality}${stream.size != null ? '  ·  ${stream.size}' : ''}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 14),
+              _DestinationOptionTile(
+                icon: Icons.phone_android_rounded,
+                title: 'Save in App',
+                subtitle:
+                    'Permanent offline access inside InFlex with audio tracks, subtitles & watch history',
+                accent: _gold,
+                onTap: () => Navigator.pop(ctx, false),
+              ),
+              const SizedBox(height: 10),
+              _DestinationOptionTile(
+                icon: Icons.video_library_rounded,
+                title: 'Save in App + Phone Gallery',
+                subtitle:
+                    'Keeps offline in InFlex AND exports video directly to your Gallery (Movies/InFlex)',
+                accent: const Color(0xFF22C55E),
+                onTap: () => Navigator.pop(ctx, true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _startDownload(stream, saveToGallery: choice);
+  }
+
+  Future<void> _startDownload(
+    TorrentStream stream, {
+    required bool saveToGallery,
+  }) async {
+    final service = context.read<DownloadService>();
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final nav = Navigator.of(context);
+    final season = _isTv ? widget.season : null;
+    final episode = _isTv ? widget.episode : null;
+    try {
+      await service.enqueue(
+        stream: stream,
+        item: widget.item,
+        imdbId: _imdbId,
+        season: season,
+        episode: episode,
+        episodeTitle: widget.episodeTitle,
+        quality: stream.quality,
+        saveToGallery: saveToGallery,
+      );
+      if (mounted) {
+        nav.pop();
+      }
+      messenger?.showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFF171722),
+          content: Text(
+            saveToGallery
+                ? 'Downloading $_playbackTitle (App + Gallery)'
+                : 'Downloading $_playbackTitle to InFlex library',
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w600,
+              fontSize: 13,
+            ),
+          ),
+          action: SnackBarAction(
+            label: 'VIEW',
+            textColor: _gold,
+            onPressed: () {
+              nav.push(
+                MaterialPageRoute(builder: (_) => const DownloadsScreen()),
+              );
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text('Could not start download: $e'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    }
   }
 
   String _fmtDuration(Duration d) {
@@ -562,12 +700,17 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('SELECT SOURCE',
-                            style: TextStyle(
-                                color: _gold,
-                                fontSize: 10,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 1.5)),
+                        Text(
+                          widget.downloadMode
+                              ? 'DOWNLOAD PERMANENTLY'
+                              : 'SELECT SOURCE',
+                          style: const TextStyle(
+                            color: _gold,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.5,
+                          ),
+                        ),
                         const SizedBox(height: 2),
                         Text(
                           _loading
@@ -589,7 +732,35 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
                 ],
               ),
             ),
-            if (_resume != null) _buildResumeBanner(_resume!),
+            if (widget.downloadMode)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _DestinationPill(
+                        icon: Icons.phone_android_rounded,
+                        label: 'Save in App',
+                        selected: !_alsoSaveToGallery,
+                        onTap: () =>
+                            setState(() => _alsoSaveToGallery = false),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _DestinationPill(
+                        icon: Icons.video_library_rounded,
+                        label: 'App + Gallery',
+                        selected: _alsoSaveToGallery,
+                        onTap: () =>
+                            setState(() => _alsoSaveToGallery = true),
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            else if (_resume != null)
+              _buildResumeBanner(_resume!),
             const Divider(color: Colors.white12, height: 1),
             // Body
             Expanded(child: _buildBody(controller)),
@@ -669,21 +840,31 @@ class _StreamBottomSheetState extends State<StreamBottomSheet> {
 
               // ── Peer-to-peer torrent sources ────────────────────────────
               if (p2pStreams.isNotEmpty) ...[
-                const _SectionHeader(
-                  icon: Icons.hub_rounded,
-                  label: 'TORRENT SOURCES',
+                _SectionHeader(
+                  icon: widget.downloadMode
+                      ? Icons.download_for_offline_rounded
+                      : Icons.hub_rounded,
+                  label: widget.downloadMode
+                      ? 'DOWNLOAD SOURCES'
+                      : 'TORRENT SOURCES',
                   color: _gold,
-                  subtitle: 'Streams peer-to-peer · tap to play',
+                  subtitle: widget.downloadMode
+                      ? 'Tap any source to download permanently'
+                      : 'Streams peer-to-peer · tap to play',
                 ),
                 ...p2pStreams.map((s) => _StreamTile(
                       stream: s,
                       langTags: _tagsFor(s),
+                      downloadPrimary: widget.downloadMode,
                       onTap: () => _onTapStream(s),
+                      onDownload: widget.downloadMode
+                          ? null
+                          : () => _downloadStream(s),
                     )),
               ],
 
               // ── Embed fallbacks ───────────────────────────────────────────
-              if (embedStreams.isNotEmpty) ...[
+              if (!widget.downloadMode && embedStreams.isNotEmpty) ...[
                 const _SectionHeader(
                   icon: Icons.language_rounded,
                   label: 'EMBED SOURCES',
@@ -971,11 +1152,17 @@ class _StreamTile extends StatelessWidget {
   final TorrentStream stream;
   final List<_LangTag> langTags;
   final VoidCallback onTap;
+  final bool downloadPrimary;
+
+  /// Optional "download permanently" action (shown alongside play in stream mode).
+  final VoidCallback? onDownload;
 
   const _StreamTile({
     required this.stream,
     required this.langTags,
     required this.onTap,
+    this.downloadPrimary = false,
+    this.onDownload,
   });
 
   @override
@@ -1100,13 +1287,39 @@ class _StreamTile extends StatelessWidget {
             ),
 
             const SizedBox(width: 8),
-            Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Icon(
-                Icons.play_circle_rounded,
-                color: Colors.white24,
-                size: 22,
-              ),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Icon(
+                    downloadPrimary
+                        ? Icons.download_for_offline_rounded
+                        : Icons.play_circle_rounded,
+                    color: downloadPrimary ? _gold : Colors.white24,
+                    size: 22,
+                  ),
+                ),
+                if (onDownload != null) ...[
+                  const SizedBox(height: 6),
+                  InkWell(
+                    onTap: onDownload,
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        color: _gold.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.download_for_offline_rounded,
+                        color: _gold,
+                        size: 18,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ],
         ),
@@ -1223,6 +1436,131 @@ class _LangChip extends StatelessWidget {
       child: Text(text,
           style: TextStyle(
               color: color, fontSize: 10, fontWeight: FontWeight.w700)),
+    );
+  }
+}
+
+class _DestinationPill extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _DestinationPill({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 12),
+        decoration: BoxDecoration(
+          color: selected ? _gold : Colors.white.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: selected ? _gold : Colors.white.withValues(alpha: 0.10),
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              size: 16,
+              color: selected ? Colors.black : Colors.white70,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: selected ? Colors.black : Colors.white70,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DestinationOptionTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color accent;
+  final VoidCallback onTap;
+
+  const _DestinationOptionTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.accent,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white.withValues(alpha: 0.04),
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(icon, color: accent, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11.5,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right_rounded, color: Colors.white38),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

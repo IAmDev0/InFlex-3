@@ -1,0 +1,1968 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart' show ValueListenable, debugPrint;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:provider/provider.dart';
+
+import '../models/download_item.dart';
+import '../services/download_service.dart';
+import '../services/perf_settings.dart';
+import '../services/pip_service.dart';
+import '../services/subtitle_service.dart';
+import '../services/watch_history.dart' show WatchHistory, WatchTarget;
+
+// ── DownloadPlayerScreen ──────────────────────────────────────────────────────
+//
+// Full-featured offline video player for permanently saved movies and episodes:
+//   • Instant local playback via media_kit (HEVC / 10-bit / MKV / MP4 / 5.1)
+//   • Dual / multi-audio track switching (Hindi / English / Tamil / Telugu ...)
+//   • Embedded subtitles + optional online English subtitle lookup & sync
+//   • Double-tap ±10 s chain seeking, hold 2x speed, vertical volume swipe,
+//     controls lock + unlock chip, Picture-in-Picture, and Next Episode button
+//   • Automatic WatchHistory resume & save + in-player "Save to Gallery" action
+
+const Color _accent = Color(0xFFFFCC00);
+const Color _sheetBg = Color(0xFF17171F);
+const Duration _hideAfter = Duration(milliseconds: 3500);
+
+String _fmtTime(Duration d) {
+  final h = d.inHours;
+  final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return h > 0 ? '$h:$m:$s' : '$m:$s';
+}
+
+String _rateLabel(double r) =>
+    r == r.roundToDouble() ? '${r.toInt()}x' : '${r}x';
+
+class DownloadPlayerScreen extends StatefulWidget {
+  final DownloadItem item;
+
+  const DownloadPlayerScreen({
+    super.key,
+    required this.item,
+  });
+
+  @override
+  State<DownloadPlayerScreen> createState() => _DownloadPlayerScreenState();
+}
+
+class _DownloadPlayerScreenState extends State<DownloadPlayerScreen> {
+  late final Player _player;
+  late final VideoController _controller;
+  late DownloadItem _item = widget.item;
+
+  final List<StreamSubscription<dynamic>> _subs = [];
+
+  final ValueNotifier<Duration> _position = ValueNotifier<Duration>(Duration.zero);
+  final ValueNotifier<Duration> _duration = ValueNotifier<Duration>(Duration.zero);
+  final ValueNotifier<double?> _dragValue = ValueNotifier<double?>(null);
+  final ValueNotifier<_HudInfo?> _hud = ValueNotifier<_HudInfo?>(null);
+
+  final ValueNotifier<_OnlineSubs> _online =
+      ValueNotifier<_OnlineSubs>(const _OnlineSubs(_OnlineStatus.idle));
+  int? _activeOnline;
+  double _subDelay = 0.0;
+
+  bool _playing = false;
+  bool _buffering = false;
+  bool _opening = true;
+  bool _completed = false;
+  bool _controlsVisible = true;
+  bool _locked = false;
+  bool _unlockHint = false;
+  bool _scrubbing = false;
+  int _menusOpen = 0;
+  double _rate = 1.0;
+  String? _error;
+
+  static double _subScale = 1.0;
+  static bool _subBackground = true;
+
+  double _lastTapX = 0;
+  int _rippleSide = 0;
+  int _chainSeconds = 0;
+  bool _dragOnRight = false;
+  double _volAtDragStart = 100;
+  double _volDragAccum = 0;
+  double _rateBeforeHold = 1.0;
+
+  Timer? _hideTimer;
+  Timer? _videoWatchdog;
+  int _videoRecoveries = 0;
+  int _audioRecoveries = 0;
+  Timer? _posTimer;
+  Timer? _hudTimer;
+  Timer? _chainTimer;
+  Timer? _unlockTimer;
+  Timer? _historyTimer;
+  Duration _lastPos = Duration.zero;
+
+  bool _resumeApplied = false;
+  Duration? _resumeTarget;
+  bool _inPip = false;
+  StreamSubscription<bool>? _pipSub;
+
+  bool get _menuOpen => _menusOpen > 0;
+  bool get _busy => _buffering || _opening;
+
+  bool get _controlsShown =>
+      !_locked &&
+      (_controlsVisible ||
+          !_playing ||
+          _busy ||
+          _completed ||
+          _menuOpen ||
+          _scrubbing);
+
+  WatchTarget get _watchTarget => WatchTarget(
+        tmdbId: _item.tmdbId,
+        mediaType: _item.mediaType,
+        title: _item.title,
+        posterPath: _item.posterPath,
+        backdropPath: _item.backdropPath,
+        season: _item.season,
+        episode: _item.episode,
+      );
+
+  @override
+  void initState() {
+    super.initState();
+
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+
+    _resumeTarget = WatchHistory.get(
+      _item.tmdbId,
+      _item.mediaType,
+      season: _item.season,
+      episode: _item.episode,
+    )?.position;
+
+    _player = Player(
+      configuration: PlayerConfiguration(
+        logLevel: MPVLogLevel.warn,
+        bufferSize: PerfSettings.playerBufferBytes,
+      ),
+    );
+    _controller = VideoController(
+      _player,
+      configuration: const VideoControllerConfiguration(
+        hwdec: 'mediacodec-copy',
+      ),
+    );
+
+    _subs.add(_player.stream.error.listen((err) {
+      debugPrint('[DownloadPlayerScreen] mpv error: $err');
+      if (!mounted) return;
+      if (_isAudioError(err)) {
+        _recoverAudio();
+      } else if (_isFatalError(err)) {
+        setState(() => _error = err);
+      }
+    }));
+
+    _subs.add(_player.stream.playing.listen((playing) {
+      PipService.setState(allowed: true, playing: playing);
+      if (playing) {
+        _videoWatchdog ??=
+            Timer(const Duration(seconds: 5), _checkVideoRendering);
+      }
+      if (!mounted) return;
+      setState(() {
+        _playing = playing;
+        if (playing) {
+          _controlsVisible = true;
+          _opening = false;
+        }
+      });
+      _scheduleHide();
+    }));
+
+    _subs.add(_player.stream.buffering.listen((buffering) {
+      if (!mounted) return;
+      setState(() => _buffering = buffering);
+      _scheduleHide();
+    }));
+
+    _subs.add(_player.stream.completed.listen((completed) {
+      if (!mounted) return;
+      setState(() => _completed = completed);
+    }));
+
+    _subs.add(_player.stream.duration.listen((d) {
+      _duration.value = d;
+      if (d > Duration.zero && _opening && mounted) {
+        setState(() => _opening = false);
+      }
+      _applyResumeOnce(d);
+    }));
+
+    _subs.add(_player.stream.position.listen((p) {
+      _lastPos = p;
+      _posTimer ??= Timer(const Duration(milliseconds: 200), () {
+        _posTimer = null;
+        if (mounted) _position.value = _lastPos;
+      });
+    }));
+
+    _historyTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) => _saveProgress());
+
+    _pipSub = PipService.modeChanges.listen((inPip) {
+      if (!mounted) return;
+      setState(() => _inPip = inPip);
+    });
+
+    _initAndOpen();
+    _loadOnlineSubtitles();
+  }
+
+  Future<void> _initAndOpen() async {
+    final platform = _player.platform;
+    if (platform is NativePlayer) {
+      await platform.setProperty('audio-channels', 'stereo');
+      await platform.setProperty('ao', 'audiotrack,opensles');
+      await platform.setProperty('audio-fallback-to-null', 'yes');
+    }
+    await _openLocalFile(_item);
+  }
+
+  Future<void> _openLocalFile(DownloadItem target) async {
+    final file = File(target.filePath);
+    if (!await file.exists()) {
+      if (mounted) {
+        setState(() => _error = 'Downloaded file was not found on device.');
+      }
+      return;
+    }
+    try {
+      await _player.open(Media(file.path));
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _switchToEpisode(DownloadItem nextEp) async {
+    await _saveProgress();
+    setState(() {
+      _item = nextEp;
+      _opening = true;
+      _completed = false;
+      _error = null;
+      _activeOnline = null;
+      _resumeApplied = false;
+      _resumeTarget = WatchHistory.get(
+        nextEp.tmdbId,
+        nextEp.mediaType,
+        season: nextEp.season,
+        episode: nextEp.episode,
+      )?.position;
+    });
+    _position.value = Duration.zero;
+    _duration.value = Duration.zero;
+    await _openLocalFile(nextEp);
+    _loadOnlineSubtitles();
+  }
+
+  void _applyResumeOnce(Duration duration) {
+    if (_resumeApplied) return;
+    final target = _resumeTarget;
+    if (target == null || duration <= Duration.zero) return;
+    _resumeApplied = true;
+    if (target < duration - const Duration(seconds: 45)) {
+      _player.seek(target);
+      _position.value = target;
+    }
+  }
+
+  Future<void> _saveProgress() async {
+    final position = _player.state.position;
+    final duration = _player.state.duration;
+    if (duration <= Duration.zero) return;
+    try {
+      await WatchHistory.save(
+        _watchTarget,
+        position: position,
+        duration: duration,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _checkVideoRendering() async {
+    _videoWatchdog = null;
+    if (!mounted || _error != null) return;
+    if ((_player.state.width ?? 0) > 0) return;
+    if (!_player.state.playing || _player.state.buffering) {
+      _videoWatchdog = Timer(const Duration(seconds: 5), _checkVideoRendering);
+      return;
+    }
+    _videoRecoveries++;
+    final platform = _player.platform;
+    if (_videoRecoveries == 1 && platform is NativePlayer) {
+      _showHud(Icons.videocam_rounded, 'Switching to software decoder...');
+      try {
+        await platform.setProperty('hwdec', 'no');
+        await _player.seek(_player.state.position);
+      } catch (_) {}
+    }
+  }
+
+  bool _isAudioError(String err) {
+    final e = err.toLowerCase();
+    return e.contains('audio') ||
+        e.contains('[ao') ||
+        e.contains('ao/') ||
+        e.contains('audiotrack') ||
+        e.contains('opensles') ||
+        e.contains('[ad') ||
+        e.contains('ad/');
+  }
+
+  bool _isFatalError(String err) {
+    final e = err.toLowerCase();
+    if (e.contains('exceeds_capabilities') ||
+        e.contains('hevc') ||
+        e.contains('hvc') ||
+        e.contains('videoerror')) {
+      return true;
+    }
+    final started =
+        _player.state.duration > Duration.zero || _player.state.playing;
+    return !started;
+  }
+
+  Future<void> _recoverAudio() async {
+    if (!mounted) return;
+    _audioRecoveries++;
+    final platform = _player.platform;
+    try {
+      if (_audioRecoveries == 1 && platform is NativePlayer) {
+        await platform.setProperty('ao', 'opensles');
+        _showHud(Icons.volume_up_rounded, 'Audio output switched');
+        return;
+      }
+      if (_audioRecoveries == 2) {
+        final audios = _player.state.tracks.audio
+            .where((t) => t.id != 'auto' && t.id != 'no')
+            .toList();
+        final cur = _player.state.track.audio.id;
+        final i = audios.indexWhere((t) => t.id == cur);
+        if (audios.length > 1) {
+          await _player.setAudioTrack(audios[(i + 1) % audios.length]);
+          _showHud(Icons.audiotrack_rounded, 'Switched audio track');
+        }
+      }
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
+    PipService.setState(allowed: false, playing: false);
+    _pipSub?.cancel();
+    unawaited(_saveProgress());
+
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _hideTimer?.cancel();
+    _videoWatchdog?.cancel();
+    _posTimer?.cancel();
+    _historyTimer?.cancel();
+    _hudTimer?.cancel();
+    _chainTimer?.cancel();
+    _unlockTimer?.cancel();
+
+    _position.dispose();
+    _duration.dispose();
+    _dragValue.dispose();
+    _hud.dispose();
+    _online.dispose();
+
+    _player.dispose();
+    super.dispose();
+  }
+
+  // ── Controls & gestures ────────────────────────────────────────────────────
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    if (!_playing || _busy || _menuOpen || _scrubbing || _locked) return;
+    _hideTimer = Timer(_hideAfter, () {
+      if (mounted) setState(() => _controlsVisible = false);
+    });
+  }
+
+  void _showControls() {
+    setState(() => _controlsVisible = true);
+    _scheduleHide();
+  }
+
+  void _togglePlay() {
+    if (_completed) {
+      _player.seek(Duration.zero);
+      _player.play();
+    } else if (_player.state.playing) {
+      _player.pause();
+    } else {
+      _player.play();
+    }
+    _scheduleHide();
+  }
+
+  void _seekTo(Duration target) {
+    final dur = _duration.value;
+    var clamped = target;
+    if (clamped < Duration.zero) clamped = Duration.zero;
+    if (dur > Duration.zero && clamped > dur) clamped = dur;
+    _player.seek(clamped);
+    _position.value = clamped;
+  }
+
+  void _seekBy(int seconds) {
+    _seekTo(_player.state.position + Duration(seconds: seconds));
+  }
+
+  void _seekToFraction(double fraction) {
+    final dur = _duration.value;
+    if (dur <= Duration.zero) return;
+    _seekTo(Duration(milliseconds: (dur.inMilliseconds * fraction).round()));
+  }
+
+  void _setRate(double rate) {
+    setState(() => _rate = rate);
+    _player.setRate(rate);
+  }
+
+  void _showHud(IconData icon, String text) {
+    _hud.value = _HudInfo(icon, text);
+    _hudTimer?.cancel();
+    _hudTimer = Timer(const Duration(milliseconds: 800), () {
+      _hud.value = null;
+    });
+  }
+
+  void _onTap() {
+    if (_locked) {
+      setState(() => _unlockHint = true);
+      _unlockTimer?.cancel();
+      _unlockTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) setState(() => _unlockHint = false);
+      });
+      return;
+    }
+    if (_chainTimer?.isActive ?? false) {
+      _handleSeekTap();
+      return;
+    }
+    if (_controlsVisible) {
+      setState(() => _controlsVisible = false);
+      _hideTimer?.cancel();
+    } else {
+      _showControls();
+    }
+  }
+
+  void _onDoubleTap() {
+    if (_locked) return;
+    _handleSeekTap();
+  }
+
+  void _handleSeekTap() {
+    final width = MediaQuery.sizeOf(context).width;
+    final x = _lastTapX;
+    final side = x < width * 0.4 ? -1 : (x > width * 0.6 ? 1 : 0);
+    if (side == 0) {
+      _togglePlay();
+      return;
+    }
+    if (side != _rippleSide) _chainSeconds = 0;
+    _chainSeconds += 10;
+    _seekBy(side * 10);
+    setState(() => _rippleSide = side);
+    _chainTimer?.cancel();
+    _chainTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) {
+        setState(() {
+          _rippleSide = 0;
+          _chainSeconds = 0;
+        });
+      }
+    });
+  }
+
+  void _onLongPressStart(LongPressStartDetails details) {
+    if (_locked) return;
+    _rateBeforeHold = _rate;
+    _player.setRate(2.0);
+    _hud.value = const _HudInfo(Icons.fast_forward_rounded, '2x speed');
+    _hudTimer?.cancel();
+  }
+
+  void _onLongPressEnd(LongPressEndDetails details) {
+    if (_locked) return;
+    _player.setRate(_rateBeforeHold);
+    _hud.value = null;
+  }
+
+  void _onVDragStart(DragStartDetails details) {
+    if (_locked) return;
+    final width = MediaQuery.sizeOf(context).width;
+    _dragOnRight = details.localPosition.dx > width / 2;
+    _volAtDragStart = _player.state.volume;
+    _volDragAccum = 0;
+  }
+
+  void _onVDragUpdate(DragUpdateDetails details) {
+    if (_locked || !_dragOnRight) return;
+    final height = MediaQuery.sizeOf(context).height;
+    _volDragAccum -= details.delta.dy;
+    final v = (_volAtDragStart + _volDragAccum / (height * 0.7) * 100)
+        .clamp(0.0, 100.0)
+        .toDouble();
+    _player.setVolume(v);
+    _showHud(
+      v == 0
+          ? Icons.volume_off_rounded
+          : (v < 50 ? Icons.volume_down_rounded : Icons.volume_up_rounded),
+      '${v.round()}%',
+    );
+  }
+
+  // ── Subtitles & audio sheets ───────────────────────────────────────────────
+
+  static const String _onlineTitlePrefix = 'English (online';
+
+  bool _isOnlineTrack(SubtitleTrack t) =>
+      (t.title ?? '').startsWith(_onlineTitlePrefix);
+
+  int _subtitleGen = 0;
+
+  Future<void> _loadOnlineSubtitles() async {
+    final imdb = _item.imdbId;
+    if (imdb == null || imdb.isEmpty) {
+      _online.value = const _OnlineSubs(_OnlineStatus.idle);
+      return;
+    }
+    final gen = ++_subtitleGen;
+    _online.value = const _OnlineSubs(_OnlineStatus.loading);
+    try {
+      final subs = await SubtitleService.fetchEnglish(
+        SubtitleQuery(
+          imdbId: imdb,
+          type: _item.isSeries ? 'series' : 'movie',
+          season: _item.season,
+          episode: _item.episode,
+          fileName: _item.fileNameHint ?? _item.fileName,
+          videoSize: _item.totalBytes,
+        ),
+      );
+      if (!mounted || gen != _subtitleGen) return;
+      _online.value = _OnlineSubs(_OnlineStatus.ready, subs);
+    } catch (_) {
+      if (!mounted || gen != _subtitleGen) return;
+      _online.value = const _OnlineSubs(_OnlineStatus.error);
+    }
+  }
+
+  Future<void> _useOnlineSubtitle(int index) async {
+    final subs = _online.value.subs;
+    if (index < 0 || index >= subs.length) return;
+    await _player.setSubtitleTrack(SubtitleTrack.uri(
+      subs[index].url,
+      title: '$_onlineTitlePrefix ${index + 1})',
+      language: 'eng',
+    ));
+    if (mounted) setState(() => _activeOnline = index);
+  }
+
+  Future<void> _setSubDelay(double seconds) async {
+    final rounded = ((seconds.clamp(-300.0, 300.0)) * 10).round() / 10;
+    final platform = _player.platform;
+    if (platform is NativePlayer) {
+      await platform.setProperty('sub-delay', rounded.toStringAsFixed(1));
+    }
+    if (mounted) setState(() => _subDelay = rounded);
+  }
+
+  String _delayLabel(double v) =>
+      v == 0 ? 'In sync' : '${v > 0 ? '+' : ''}${v.toStringAsFixed(1)} s';
+
+  Future<void> _saveToGalleryFromPlayer() async {
+    final dl = context.read<DownloadService>();
+    _showHud(Icons.photo_library_rounded, 'Saving to Gallery...');
+    final res = await dl.saveToGallery(_item.id);
+    if (!mounted) return;
+    final refreshed = dl.getById(_item.id);
+    if (refreshed != null) {
+      setState(() => _item = refreshed);
+    }
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(
+      content: Text(
+        res.ok
+            ? 'Saved to Gallery (${res.location ?? 'Movies/InFlex'})'
+            : (res.error ?? 'Could not save to Gallery'),
+      ),
+      backgroundColor: res.ok ? const Color(0xFF16A34A) : Colors.redAccent,
+    ));
+  }
+
+  Future<void> _openSheet(WidgetBuilder builder) async {
+    setState(() => _menusOpen++);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: _sheetBg,
+      barrierColor: Colors.black54,
+      constraints: BoxConstraints(
+        maxWidth: 480,
+        maxHeight: MediaQuery.sizeOf(context).height * 0.92,
+      ),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: builder,
+    );
+    if (!mounted) return;
+    setState(() => _menusOpen--);
+    _scheduleHide();
+  }
+
+  Future<void> _openSettingsSheet() => _openSheet((ctx) {
+        return StreamBuilder<Track>(
+          stream: _player.stream.track,
+          initialData: _player.state.track,
+          builder: (context, snap) {
+            final track = snap.data ?? _player.state.track;
+            final tracks = _player.state.tracks;
+            return _SheetScaffold(
+              title: 'Player Settings',
+              children: [
+                _SheetRow(
+                  icon: Icons.speed_rounded,
+                  label: 'Playback speed',
+                  value: _rateLabel(_rate),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _openSpeedSheet();
+                  },
+                ),
+                _SheetRow(
+                  icon: Icons.audiotrack_rounded,
+                  label: 'Audio track',
+                  value: _selectedAudioLabel(tracks, track),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _openAudioSheet();
+                  },
+                ),
+                _SheetRow(
+                  icon: Icons.closed_caption_rounded,
+                  label: 'Subtitles',
+                  value: _selectedSubtitleLabel(tracks, track),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _openSubtitleSheet();
+                  },
+                ),
+                _SheetRow(
+                  icon: _item.savedToGallery
+                      ? Icons.check_circle_rounded
+                      : Icons.save_alt_rounded,
+                  label: _item.savedToGallery
+                      ? 'Saved in Gallery'
+                      : 'Save copy to Gallery',
+                  sublabel: _item.galleryLocation ?? 'Movies/InFlex',
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _saveToGalleryFromPlayer();
+                  },
+                ),
+              ],
+            );
+          },
+        );
+      });
+
+  Future<void> _openSpeedSheet() => _openSheet((ctx) {
+        return _SheetScaffold(
+          title: 'Playback speed',
+          children: [
+            for (final s in _speeds)
+              _SheetRow(
+                label: _rateLabel(s),
+                selected: s == _rate,
+                onTap: () {
+                  _setRate(s);
+                  Navigator.pop(ctx);
+                },
+              ),
+          ],
+        );
+      });
+
+  Future<void> _openAudioSheet() => _openSheet((ctx) {
+        return StreamBuilder<Tracks>(
+          stream: _player.stream.tracks,
+          initialData: _player.state.tracks,
+          builder: (context, tracksSnap) {
+            return StreamBuilder<Track>(
+              stream: _player.stream.track,
+              initialData: _player.state.track,
+              builder: (context, trackSnap) {
+                final tracks = tracksSnap.data ?? _player.state.tracks;
+                final selected = (trackSnap.data ?? _player.state.track).audio;
+                final audios = tracks.audio
+                    .where((t) => t.id != 'auto' && t.id != 'no')
+                    .toList();
+                return _SheetScaffold(
+                  title: 'Audio',
+                  children: [
+                    if (audios.isEmpty)
+                      const _SheetNote('No separate audio tracks in this file.'),
+                    for (var i = 0; i < audios.length; i++)
+                      _SheetRow(
+                        label: _trackLabel(
+                            audios[i].title, audios[i].language, i + 1),
+                        sublabel: _audioDetail(audios[i]),
+                        selected: selected.id == audios[i].id,
+                        onTap: () {
+                          _player.setAudioTrack(audios[i]);
+                          Navigator.pop(ctx);
+                        },
+                      ),
+                  ],
+                );
+              },
+            );
+          },
+        );
+      });
+
+  Future<void> _openSubtitleSheet() => _openSheet((ctx) {
+        return StatefulBuilder(builder: (context, setSheet) {
+          return StreamBuilder<Tracks>(
+            stream: _player.stream.tracks,
+            initialData: _player.state.tracks,
+            builder: (context, tracksSnap) {
+              return StreamBuilder<Track>(
+                stream: _player.stream.track,
+                initialData: _player.state.track,
+                builder: (context, trackSnap) {
+                  final tracks = tracksSnap.data ?? _player.state.tracks;
+                  final selected =
+                      (trackSnap.data ?? _player.state.track).subtitle;
+                  final subs = tracks.subtitle
+                      .where((t) =>
+                          t.id != 'auto' && t.id != 'no' && !_isOnlineTrack(t))
+                      .toList();
+                  return _SheetScaffold(
+                    title: 'Subtitles',
+                    children: [
+                      _SheetRow(
+                        label: 'Off',
+                        selected: selected.id == 'no',
+                        onTap: () {
+                          _player.setSubtitleTrack(SubtitleTrack.no());
+                          setState(() => _activeOnline = null);
+                          Navigator.pop(ctx);
+                        },
+                      ),
+                      if (subs.isEmpty)
+                        const _SheetNote(
+                            'No embedded subtitles found in this file.'),
+                      for (var i = 0; i < subs.length; i++)
+                        _SheetRow(
+                          label: _trackLabel(
+                              subs[i].title, subs[i].language, i + 1),
+                          selected: selected.id == subs[i].id,
+                          onTap: () {
+                            _player.setSubtitleTrack(subs[i]);
+                            setState(() => _activeOnline = null);
+                            Navigator.pop(ctx);
+                          },
+                        ),
+                      const Divider(color: Colors.white12, height: 24),
+                      const _SheetLabel('ONLINE  ·  ENGLISH'),
+                      ValueListenableBuilder<_OnlineSubs>(
+                        valueListenable: _online,
+                        builder: (context, online, _) {
+                          final currentIsOnline = tracks.subtitle.any(
+                              (t) => t.id == selected.id && _isOnlineTrack(t));
+                          switch (online.status) {
+                            case _OnlineStatus.idle:
+                              return const _SheetNote(
+                                  'Online subtitles unavailable offline.');
+                            case _OnlineStatus.loading:
+                              return const _SheetNote(
+                                  'Searching for English subtitles...');
+                            case _OnlineStatus.error:
+                              return _SheetRow(
+                                icon: Icons.refresh_rounded,
+                                label: 'Offline — tap to retry online subtitles',
+                                onTap: _loadOnlineSubtitles,
+                              );
+                            case _OnlineStatus.ready:
+                              if (online.subs.isEmpty) {
+                                return const _SheetNote(
+                                    'No English subtitles found online.');
+                              }
+                              return Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  for (var i = 0; i < online.subs.length; i++)
+                                    _SheetRow(
+                                      label: 'English · Option ${i + 1}',
+                                      selected:
+                                          currentIsOnline && _activeOnline == i,
+                                      onTap: () {
+                                        _useOnlineSubtitle(i);
+                                        Navigator.pop(ctx);
+                                      },
+                                    ),
+                                ],
+                              );
+                          }
+                        },
+                      ),
+                      const Divider(color: Colors.white12, height: 24),
+                      const _SheetLabel('Size'),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Wrap(
+                          spacing: 8,
+                          children: [
+                            for (var i = 0; i < _sizeNames.length; i++)
+                              _OptionChip(
+                                label: _sizeNames[i],
+                                selected: _subScale == _sizeValues[i],
+                                onTap: () {
+                                  setState(() => _subScale = _sizeValues[i]);
+                                  setSheet(() {});
+                                },
+                              ),
+                          ],
+                        ),
+                      ),
+                      const _SheetLabel('Style'),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        child: Wrap(
+                          spacing: 8,
+                          children: [
+                            _OptionChip(
+                              label: 'Box',
+                              selected: _subBackground,
+                              onTap: () {
+                                setState(() => _subBackground = true);
+                                setSheet(() {});
+                              },
+                            ),
+                            _OptionChip(
+                              label: 'Outline',
+                              selected: !_subBackground,
+                              onTap: () {
+                                setState(() => _subBackground = false);
+                                setSheet(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                      const _SheetLabel('Timing'),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final step in const [-5.0, -0.5, 0.5, 5.0])
+                              _OptionChip(
+                                label: step > 0
+                                    ? '+${step.toString().replaceAll('.0', '')} s'
+                                    : '${step.toString().replaceAll('.0', '')} s',
+                                selected: false,
+                                onTap: () async {
+                                  await _setSubDelay(_subDelay + step);
+                                  setSheet(() {});
+                                },
+                              ),
+                            if (_subDelay != 0)
+                              _OptionChip(
+                                label: 'Reset',
+                                selected: false,
+                                onTap: () async {
+                                  await _setSubDelay(0);
+                                  setSheet(() {});
+                                },
+                              ),
+                          ],
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        child: Text(
+                          _delayLabel(_subDelay),
+                          style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          );
+        });
+      });
+
+  static const List<double> _speeds = [
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+  ];
+  static const List<String> _sizeNames = ['Small', 'Medium', 'Large', 'Huge'];
+  static const List<double> _sizeValues = [0.8, 1.0, 1.3, 1.6];
+
+  String _selectedAudioLabel(Tracks tracks, Track current) {
+    final audios =
+        tracks.audio.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    for (var i = 0; i < audios.length; i++) {
+      if (audios[i].id == current.audio.id) {
+        return _trackLabel(audios[i].title, audios[i].language, i + 1);
+      }
+    }
+    return audios.isEmpty ? 'Default' : 'Auto';
+  }
+
+  String _selectedSubtitleLabel(Tracks tracks, Track current) {
+    if (current.subtitle.id == 'no') return 'Off';
+    for (final t in tracks.subtitle) {
+      if (t.id == current.subtitle.id && _isOnlineTrack(t)) {
+        return 'English (online)';
+      }
+    }
+    final subs = tracks.subtitle
+        .where((t) => t.id != 'auto' && t.id != 'no' && !_isOnlineTrack(t))
+        .toList();
+    for (var i = 0; i < subs.length; i++) {
+      if (subs[i].id == current.subtitle.id) {
+        return _trackLabel(subs[i].title, subs[i].language, i + 1);
+      }
+    }
+    return subs.isEmpty ? 'None' : 'Auto';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_error != null) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline,
+                      color: Colors.redAccent, size: 48),
+                  const SizedBox(height: 16),
+                  Text(_error!,
+                      textAlign: TextAlign.center,
+                      style:
+                          const TextStyle(color: Colors.white60, fontSize: 14)),
+                  const SizedBox(height: 24),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Go Back',
+                        style: TextStyle(color: Colors.white54)),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_inPip) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Video(
+          controller: _controller,
+          controls: NoVideoControls,
+          fill: Colors.black,
+        ),
+      );
+    }
+
+    final nextEp = context.watch<DownloadService>().nextCompletedEpisode(_item);
+    final shown = _controlsShown;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          Video(
+            controller: _controller,
+            controls: NoVideoControls,
+            fill: Colors.black,
+            subtitleViewConfiguration:
+                const SubtitleViewConfiguration(visible: false),
+          ),
+          _SubtitleLayer(
+            player: _player,
+            bottom: shown ? 96 : 28,
+            scale: _subScale,
+            background: _subBackground,
+          ),
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (d) => _lastTapX = d.localPosition.dx,
+              onTap: _onTap,
+              onDoubleTapDown: (d) => _lastTapX = d.localPosition.dx,
+              onDoubleTap: _onDoubleTap,
+              onLongPressStart: _onLongPressStart,
+              onLongPressEnd: _onLongPressEnd,
+              onVerticalDragStart: _onVDragStart,
+              onVerticalDragUpdate: _onVDragUpdate,
+            ),
+          ),
+          if (_rippleSide != 0)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _rippleSide < 0
+                          ? _SeekRipple(left: true, seconds: _chainSeconds)
+                          : const SizedBox.shrink(),
+                    ),
+                    Expanded(
+                      child: _rippleSide > 0
+                          ? _SeekRipple(left: false, seconds: _chainSeconds)
+                          : const SizedBox.shrink(),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          Positioned.fill(
+            child: IgnorePointer(
+              ignoring: !shown,
+              child: AnimatedOpacity(
+                opacity: shown ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 200),
+                child: _buildControls(nextEp),
+              ),
+            ),
+          ),
+          if (_locked && _unlockHint)
+            Positioned(
+              bottom: 28,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _locked = false;
+                      _unlockHint = false;
+                    });
+                    _showControls();
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.lock_open_rounded,
+                            color: _accent, size: 16),
+                        SizedBox(width: 8),
+                        Text('Tap to unlock',
+                            style:
+                                TextStyle(color: Colors.white, fontSize: 13)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          Positioned.fill(
+            child: IgnorePointer(
+              child: ValueListenableBuilder<_HudInfo?>(
+                valueListenable: _hud,
+                builder: (context, hud, _) {
+                  if (hud == null) return const SizedBox.shrink();
+                  return Align(
+                    alignment: Alignment.topCenter,
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 28),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.72),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(hud.icon, color: Colors.white, size: 18),
+                            const SizedBox(width: 8),
+                            Text(hud.text,
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControls(DownloadItem? nextEp) {
+    final IconData mainIcon = _completed
+        ? Icons.replay_rounded
+        : (_playing ? Icons.pause_rounded : Icons.play_arrow_rounded);
+
+    return Stack(
+      children: [
+        const Positioned(
+          top: 0,
+          left: 0,
+          right: 0,
+          child: IgnorePointer(child: _Gradient(fromTop: true, height: 110)),
+        ),
+        const Positioned(
+          bottom: 0,
+          left: 0,
+          right: 0,
+          child: IgnorePointer(child: _Gradient(fromTop: false, height: 150)),
+        ),
+        Positioned(
+          top: 0,
+          left: 0,
+          right: 0,
+          child: SafeArea(
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.arrow_back_rounded),
+                    color: Colors.white,
+                    tooltip: 'Back',
+                    onPressed: () => Navigator.of(context).maybePop(),
+                  ),
+                  Expanded(
+                    child: IgnorePointer(
+                      child: Text(
+                        _item.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          shadows: [
+                            Shadow(blurRadius: 6, color: Colors.black54),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Container(
+                    margin: const EdgeInsets.only(right: 6),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF22C55E).withValues(alpha: 0.16),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                          color:
+                              const Color(0xFF22C55E).withValues(alpha: 0.35)),
+                    ),
+                    child: Text(
+                      'OFFLINE · ${_item.quality}',
+                      style: const TextStyle(
+                        color: Color(0xFF22C55E),
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  if (nextEp != null)
+                    TextButton.icon(
+                      style: TextButton.styleFrom(
+                        foregroundColor: _accent,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                      ),
+                      onPressed: () => _switchToEpisode(nextEp),
+                      icon: const Icon(Icons.skip_next_rounded, size: 18),
+                      label: Text(
+                        nextEp.episodeCode ?? 'Next',
+                        style: const TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  IconButton(
+                    icon: const Icon(Icons.closed_caption_rounded),
+                    color: Colors.white,
+                    tooltip: 'Subtitles',
+                    onPressed: _openSubtitleSheet,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.picture_in_picture_alt_rounded),
+                    color: Colors.white,
+                    tooltip: 'Picture in picture',
+                    onPressed: () => PipService.enter(),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.settings_rounded),
+                    color: Colors.white,
+                    tooltip: 'Settings',
+                    onPressed: _openSettingsSheet,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _CircleButton(
+                icon: Icons.replay_10_rounded,
+                size: 52,
+                iconSize: 28,
+                onTap: () {
+                  _seekBy(-10);
+                  _scheduleHide();
+                },
+              ),
+              const SizedBox(width: 36),
+              SizedBox(
+                width: 72,
+                height: 72,
+                child: _busy
+                    ? const Center(
+                        child: SizedBox(
+                          width: 46,
+                          height: 46,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 3.5, color: _accent),
+                        ),
+                      )
+                    : _CircleButton(
+                        icon: mainIcon,
+                        size: 72,
+                        iconSize: 44,
+                        onTap: _togglePlay,
+                      ),
+              ),
+              const SizedBox(width: 36),
+              _CircleButton(
+                icon: Icons.forward_10_rounded,
+                size: 52,
+                iconSize: 28,
+                onTap: () {
+                  _seekBy(10);
+                  _scheduleHide();
+                },
+              ),
+            ],
+          ),
+        ),
+        Positioned(
+          bottom: 0,
+          left: 0,
+          right: 0,
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 12, 6),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: _SeekBar(
+                      position: _position,
+                      duration: _duration,
+                      dragValue: _dragValue,
+                      onScrubStart: () {
+                        setState(() => _scrubbing = true);
+                        _hideTimer?.cancel();
+                      },
+                      onScrubEnd: (fraction) {
+                        setState(() => _scrubbing = false);
+                        if (fraction != null) _seekToFraction(fraction);
+                        _scheduleHide();
+                      },
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      IgnorePointer(
+                        child: _TimeLabel(
+                          position: _position,
+                          duration: _duration,
+                          dragValue: _dragValue,
+                        ),
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        icon: const Icon(Icons.lock_open_rounded, size: 22),
+                        color: Colors.white,
+                        tooltip: 'Lock controls',
+                        onPressed: () {
+                          setState(() {
+                            _locked = true;
+                            _unlockHint = false;
+                          });
+                          _hideTimer?.cancel();
+                        },
+                      ),
+                      TextButton(
+                        onPressed: _openSpeedSheet,
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size(48, 40),
+                        ),
+                        child: Text(
+                          _rateLabel(_rate),
+                          style: const TextStyle(
+                              fontSize: 13, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Language & UI helper widgets ─────────────────────────────────────────────
+
+const Map<String, String> _languageNames = {
+  'en': 'English',
+  'eng': 'English',
+  'hi': 'Hindi',
+  'hin': 'Hindi',
+  'ta': 'Tamil',
+  'tam': 'Tamil',
+  'te': 'Telugu',
+  'tel': 'Telugu',
+  'ml': 'Malayalam',
+  'mal': 'Malayalam',
+  'kn': 'Kannada',
+  'kan': 'Kannada',
+  'bn': 'Bengali',
+  'ben': 'Bengali',
+  'mr': 'Marathi',
+  'mar': 'Marathi',
+  'pa': 'Punjabi',
+  'pan': 'Punjabi',
+  'gu': 'Gujarati',
+  'guj': 'Gujarati',
+  'ur': 'Urdu',
+  'urd': 'Urdu',
+  'ja': 'Japanese',
+  'jpn': 'Japanese',
+  'ko': 'Korean',
+  'kor': 'Korean',
+  'es': 'Spanish',
+  'spa': 'Spanish',
+  'fr': 'French',
+  'fre': 'French',
+  'fra': 'French',
+};
+
+String _trackLabel(String? title, String? language, int index) {
+  final lang = _languageNames[(language ?? '').toLowerCase().trim()];
+  final t = (title ?? '').trim();
+  if (lang != null && t.isNotEmpty) {
+    return t.toLowerCase().contains(lang.toLowerCase()) ? t : '$lang · $t';
+  }
+  if (lang != null) return lang;
+  if (t.isNotEmpty) return t;
+  final raw = (language ?? '').trim();
+  return raw.isNotEmpty ? raw.toUpperCase() : 'Track $index';
+}
+
+String? _audioDetail(AudioTrack t) {
+  final parts = <String>[];
+  final codec = (t.codec ?? '').trim();
+  final channels = (t.channels ?? '').trim();
+  if (codec.isNotEmpty) parts.add(codec.toUpperCase());
+  if (channels.isNotEmpty) parts.add(channels);
+  return parts.isEmpty ? null : parts.join(' · ');
+}
+
+enum _OnlineStatus { idle, loading, ready, error }
+
+class _OnlineSubs {
+  final _OnlineStatus status;
+  final List<OnlineSubtitle> subs;
+  const _OnlineSubs(this.status, [this.subs = const []]);
+}
+
+class _HudInfo {
+  final IconData icon;
+  final String text;
+  const _HudInfo(this.icon, this.text);
+}
+
+class _SubtitleLayer extends StatelessWidget {
+  final Player player;
+  final double bottom;
+  final double scale;
+  final bool background;
+
+  const _SubtitleLayer({
+    required this.player,
+    required this.bottom,
+    required this.scale,
+    required this.background,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: StreamBuilder<List<String>>(
+          stream: player.stream.subtitle,
+          initialData: player.state.subtitle,
+          builder: (context, snap) {
+            final text = [
+              for (final line in snap.data ?? const <String>[])
+                if (line.trim().isNotEmpty) line.trim(),
+            ].join('\n');
+
+            return AnimatedPadding(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              padding: EdgeInsets.fromLTRB(56, 0, 56, bottom),
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: text.isEmpty
+                    ? const SizedBox.shrink()
+                    : Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        decoration: background
+                            ? BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.62),
+                                borderRadius: BorderRadius.circular(4),
+                              )
+                            : null,
+                        child: Text(
+                          text,
+                          textAlign: TextAlign.center,
+                          textScaler: TextScaler.noScaling,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 18 * scale,
+                            height: 1.3,
+                            fontWeight: FontWeight.w500,
+                            shadows: background
+                                ? null
+                                : const [
+                                    Shadow(blurRadius: 3, color: Colors.black),
+                                    Shadow(
+                                        offset: Offset(1, 1),
+                                        blurRadius: 2,
+                                        color: Colors.black),
+                                  ],
+                          ),
+                        ),
+                      ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _SeekBar extends StatelessWidget {
+  final ValueListenable<Duration> position;
+  final ValueListenable<Duration> duration;
+  final ValueNotifier<double?> dragValue;
+  final VoidCallback onScrubStart;
+  final ValueChanged<double?> onScrubEnd;
+
+  const _SeekBar({
+    required this.position,
+    required this.duration,
+    required this.dragValue,
+    required this.onScrubStart,
+    required this.onScrubEnd,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        double frac(double dx) =>
+            width <= 0 ? 0.0 : (dx / width).clamp(0.0, 1.0).toDouble();
+
+        return SizedBox(
+          width: double.infinity,
+          height: 44,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned.fill(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapUp: (d) {
+                    if (duration.value <= Duration.zero) return;
+                    onScrubEnd(frac(d.localPosition.dx));
+                  },
+                  onHorizontalDragStart: (d) {
+                    if (duration.value <= Duration.zero) return;
+                    dragValue.value = frac(d.localPosition.dx);
+                    onScrubStart();
+                  },
+                  onHorizontalDragUpdate: (d) {
+                    if (dragValue.value == null) return;
+                    dragValue.value = frac(d.localPosition.dx);
+                  },
+                  onHorizontalDragEnd: (_) {
+                    final v = dragValue.value;
+                    dragValue.value = null;
+                    onScrubEnd(v);
+                  },
+                  onHorizontalDragCancel: () {
+                    if (dragValue.value == null) return;
+                    dragValue.value = null;
+                    onScrubEnd(null);
+                  },
+                  child: RepaintBoundary(
+                    child: CustomPaint(
+                      size: Size.infinite,
+                      painter: _SeekPainter(
+                        position: position,
+                        duration: duration,
+                        dragValue: dragValue,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              ValueListenableBuilder<double?>(
+                valueListenable: dragValue,
+                builder: (context, v, _) {
+                  if (v == null) return const SizedBox.shrink();
+                  final d = duration.value;
+                  final t =
+                      Duration(milliseconds: (d.inMilliseconds * v).round());
+                  final maxLeft = (width - 64).clamp(0.0, width).toDouble();
+                  final left = (v * width - 32).clamp(0.0, maxLeft).toDouble();
+                  return Positioned(
+                    left: left,
+                    top: -34,
+                    child: IgnorePointer(
+                      child: Container(
+                        width: 64,
+                        padding: const EdgeInsets.symmetric(vertical: 5),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          _fmtTime(t),
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SeekPainter extends CustomPainter {
+  final ValueListenable<Duration> position;
+  final ValueListenable<Duration> duration;
+  final ValueListenable<double?> dragValue;
+
+  _SeekPainter({
+    required this.position,
+    required this.duration,
+    required this.dragValue,
+  }) : super(repaint: Listenable.merge([position, duration, dragValue]));
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final durMs = duration.value.inMilliseconds;
+    final drag = dragValue.value;
+    final played = drag ??
+        (durMs > 0
+            ? (position.value.inMilliseconds / durMs).clamp(0.0, 1.0).toDouble()
+            : 0.0);
+
+    final cy = size.height / 2;
+    final h = drag != null ? 5.0 : 3.0;
+    final r = Radius.circular(h / 2);
+
+    RRect bar(double to) =>
+        RRect.fromLTRBR(0, cy - h / 2, size.width * to, cy + h / 2, r);
+
+    canvas.drawRRect(bar(1.0), Paint()..color = Colors.white24);
+    canvas.drawRRect(bar(played), Paint()..color = _accent);
+    canvas.drawCircle(Offset(size.width * played, cy), drag != null ? 9.0 : 6.5,
+        Paint()..color = _accent);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SeekPainter oldDelegate) => false;
+}
+
+class _TimeLabel extends StatelessWidget {
+  final ValueListenable<Duration> position;
+  final ValueListenable<Duration> duration;
+  final ValueListenable<double?> dragValue;
+
+  const _TimeLabel({
+    required this.position,
+    required this.duration,
+    required this.dragValue,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([position, duration, dragValue]),
+      builder: (context, _) {
+        final d = duration.value;
+        final v = dragValue.value;
+        final p = v != null
+            ? Duration(milliseconds: (d.inMilliseconds * v).round())
+            : position.value;
+        return Text(
+          '${_fmtTime(p)} / ${_fmtTime(d)}',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            shadows: [Shadow(blurRadius: 6, color: Colors.black87)],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _Gradient extends StatelessWidget {
+  final bool fromTop;
+  final double height;
+  const _Gradient({required this.fromTop, required this.height});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: height,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: fromTop ? Alignment.topCenter : Alignment.bottomCenter,
+          end: fromTop ? Alignment.bottomCenter : Alignment.topCenter,
+          colors: [Colors.black.withValues(alpha: 0.7), Colors.transparent],
+        ),
+      ),
+    );
+  }
+}
+
+class _CircleButton extends StatelessWidget {
+  final IconData icon;
+  final double size;
+  final double iconSize;
+  final VoidCallback onTap;
+
+  const _CircleButton({
+    required this.icon,
+    required this.size,
+    required this.iconSize,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.45),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: Icon(icon, color: Colors.white, size: iconSize),
+        ),
+      ),
+    );
+  }
+}
+
+class _SeekRipple extends StatelessWidget {
+  final bool left;
+  final int seconds;
+  const _SeekRipple({required this.left, required this.seconds});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.horizontal(
+          left: left ? Radius.zero : const Radius.circular(200),
+          right: left ? const Radius.circular(200) : Radius.zero,
+        ),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              left ? Icons.fast_rewind_rounded : Icons.fast_forward_rounded,
+              color: Colors.white,
+              size: 34,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '$seconds seconds',
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SheetScaffold extends StatelessWidget {
+  final String title;
+  final List<Widget> children;
+  const _SheetScaffold({required this.title, required this.children});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                title,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700),
+              ),
+            ),
+            ...children,
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SheetRow extends StatelessWidget {
+  final IconData? icon;
+  final String label;
+  final String? sublabel;
+  final String? value;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _SheetRow({
+    this.icon,
+    required this.label,
+    this.sublabel,
+    this.value,
+    this.selected = false,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            if (icon != null) ...[
+              Icon(icon, color: Colors.white70, size: 22),
+              const SizedBox(width: 16),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      color: selected ? _accent : Colors.white,
+                      fontSize: 14,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    ),
+                  ),
+                  if (sublabel != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        sublabel!,
+                        style: const TextStyle(
+                            color: Colors.white38, fontSize: 11),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            if (value != null)
+              Text(value!,
+                  style: const TextStyle(color: Colors.white54, fontSize: 13)),
+            if (selected)
+              const Padding(
+                padding: EdgeInsets.only(left: 8),
+                child: Icon(Icons.check_rounded, color: _accent, size: 20),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SheetLabel extends StatelessWidget {
+  final String text;
+  const _SheetLabel(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: Text(
+        text,
+        style: const TextStyle(
+            color: Colors.white54,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.5),
+      ),
+    );
+  }
+}
+
+class _SheetNote extends StatelessWidget {
+  final String text;
+  const _SheetNote(this.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: Text(text,
+          style: const TextStyle(color: Colors.white38, fontSize: 13)),
+    );
+  }
+}
+
+class _OptionChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _OptionChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? _accent : Colors.white.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: selected ? Colors.black : Colors.white70,
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+}

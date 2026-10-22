@@ -43,6 +43,10 @@ class AppSettings {
   /// '1080p'). The source picker sorts/badges this quality first.
   static const String keyPreferredQuality = 'preferred_quality';
 
+  /// When ON, every completed permanent download is automatically exported to
+  /// the device's Gallery ("Movies/InFlex") in addition to staying in-app.
+  static const String keyAutoSaveToGallery = 'auto_save_to_gallery';
+
   static Box<dynamic>? get _box =>
       Hive.isBoxOpen(boxName) ? Hive.box<dynamic>(boxName) : null;
 
@@ -58,6 +62,13 @@ class AppSettings {
 
   static Future<void> setHideIncompleteTitles(bool value) async {
     await _box?.put(keyHideIncompleteTitles, value);
+  }
+
+  static bool get autoSaveToGallery =>
+      (_box?.get(keyAutoSaveToGallery, defaultValue: false) as bool?) ?? false;
+
+  static Future<void> setAutoSaveToGallery(bool value) async {
+    await _box?.put(keyAutoSaveToGallery, value);
   }
 
   static bool get onboardingComplete =>
