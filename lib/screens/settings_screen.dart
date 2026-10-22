@@ -1,18 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:provider/provider.dart';
+
+import '../models/download_item.dart';
 import '../providers/tmdb_provider.dart';
 import '../services/app_settings.dart';
+import '../services/download_service.dart';
+import 'downloads_screen.dart';
 import 'performance_settings_screen.dart';
 import 'watchlist_screen.dart';
 
 // ── SettingsScreen ────────────────────────────────────────────────────────────
 //
-// Replaces the old Watchlist tab in the home screen's bottom bar. The
-// watchlist itself lives on as a sub-page of Settings ("Library"), and this
-// is where future options go (download mode, preferred language, ...).
-//
-// Everything here is persisted through AppSettings (Hive box 'settings').
+// Persistent library & playback settings stored in Hive box 'settings'.
 
 const Color _accent = Color(0xFFFFCC00);
 
@@ -21,6 +21,13 @@ class SettingsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final downloads = context.watch<DownloadService>();
+    final saved = downloads.completedCount;
+    final used = DownloadItem.formatBytes(downloads.totalSavedBytes);
+    final dlSubtitle = saved > 0
+        ? '$saved saved offline  ·  $used on device'
+        : 'Movies and series saved permanently on device';
+
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
       children: [
@@ -34,6 +41,19 @@ class SettingsScreen extends StatelessWidget {
             MaterialPageRoute(builder: (_) => const _WatchlistPage()),
           ),
         ),
+        const SizedBox(height: 10),
+        _NavTile(
+          icon: Icons.download_for_offline_rounded,
+          title: 'Downloads',
+          subtitle: dlSubtitle,
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const DownloadsScreen()),
+          ),
+        ),
+        const SizedBox(height: 24),
+        const _SectionTitle('DOWNLOADS'),
+        const _AutoSaveGalleryTile(),
         const SizedBox(height: 24),
         const _SectionTitle('CONTENT'),
         const _HideIncompleteTile(),
@@ -85,6 +105,43 @@ class _WatchlistPage extends StatelessWidget {
   }
 }
 
+// ── Auto-save downloads to Gallery ───────────────────────────────────────────
+
+class _AutoSaveGalleryTile extends StatelessWidget {
+  const _AutoSaveGalleryTile();
+
+  static const String _title = 'Auto-save downloads to Gallery';
+  static const String _description =
+      'Automatically save a permanent copy of every completed movie and episode '
+      'into your device Gallery (Movies/InFlex) alongside your in-app library.';
+
+  @override
+  Widget build(BuildContext context) {
+    if (!Hive.isBoxOpen(AppSettings.boxName)) {
+      return const _SwitchTile(
+        icon: Icons.video_library_rounded,
+        title: _title,
+        description: _description,
+        value: false,
+        experimental: false,
+        onChanged: null,
+      );
+    }
+    return ValueListenableBuilder<Box<dynamic>>(
+      valueListenable: Hive.box<dynamic>(AppSettings.boxName)
+          .listenable(keys: [AppSettings.keyAutoSaveToGallery]),
+      builder: (context, box, _) => _SwitchTile(
+        icon: Icons.video_library_rounded,
+        title: _title,
+        description: _description,
+        value: AppSettings.autoSaveToGallery,
+        experimental: false,
+        onChanged: (v) => AppSettings.setAutoSaveToGallery(v),
+      ),
+    );
+  }
+}
+
 // ── Hide incomplete titles ────────────────────────────────────────────────────
 
 class _HideIncompleteTile extends StatelessWidget {
@@ -120,8 +177,6 @@ class _HideIncompleteTile extends StatelessWidget {
         onChanged: (v) async {
           final home = context.read<TmdbProvider>();
           await AppSettings.setHideIncompleteTitles(v);
-          // Reload the home rows so the change is visible straight away
-          // (searches pick it up on the next search).
           home.loadHome();
         },
       ),

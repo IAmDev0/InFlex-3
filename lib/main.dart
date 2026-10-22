@@ -6,6 +6,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'providers/tmdb_provider.dart';
 import 'providers/watchlist_provider.dart';
+import 'services/download_service.dart';
 import 'screens/splash_screen.dart';
 import 'package:media_kit/media_kit.dart';
 import 'services/tracker_list.dart';
@@ -17,7 +18,7 @@ const _supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhY
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
-  
+
   // System UI
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
@@ -27,31 +28,35 @@ void main() async {
 
   // Supabase
   await Supabase.initialize(
-  url: _supabaseUrl,
-  anonKey: _supabaseAnonKey,
-  realtimeClientOptions: const RealtimeClientOptions(
-    eventsPerSecond: 10,
-  ),
-);
+    url: _supabaseUrl,
+    anonKey: _supabaseAnonKey,
+    realtimeClientOptions: const RealtimeClientOptions(
+      eventsPerSecond: 10,
+    ),
+  );
 
-  // Hive (watchlist only)
+  // Hive (watchlist, settings, watch_history, downloads)
   try {
     await Hive.initFlutter();
     await Hive.openBox('watchlist');
     await Hive.openBox('settings');
     await Hive.openBox('watch_history');
+    await Hive.openBox('downloads');
   } catch (e) {
     debugPrint('Hive init error, retrying clean: $e');
     try {
       await Hive.deleteBoxFromDisk('watchlist');
       await Hive.deleteBoxFromDisk('settings');
       await Hive.deleteBoxFromDisk('watch_history');
+      await Hive.deleteBoxFromDisk('downloads');
       await Hive.openBox('watchlist');
       await Hive.openBox('settings');
       await Hive.openBox('watch_history');
+      await Hive.openBox('downloads');
     } catch (_) {}
   }
-  
+
+  await DownloadService().init();
   unawaited(TrackerList.refresh());
   runApp(const InFlexApp());
 }
@@ -65,6 +70,7 @@ class InFlexApp extends StatelessWidget {
       providers: [
         ChangeNotifierProvider(create: (_) => TmdbProvider()),
         ChangeNotifierProvider(create: (_) => WatchlistProvider()),
+        ChangeNotifierProvider.value(value: DownloadService()),
       ],
       child: MaterialApp(
         title: 'InFlex',

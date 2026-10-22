@@ -1,14 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../providers/tmdb_provider.dart';
+
 import '../models/media_model.dart';
+import '../providers/tmdb_provider.dart';
+import '../services/download_service.dart';
+import '../services/watch_history.dart';
+import '../widgets/channel_row.dart';
+import '../widgets/continue_watching_row.dart';
 import '../widgets/hero_banner.dart';
 import '../widgets/media_row.dart';
-import '../widgets/continue_watching_row.dart';
-import '../widgets/channel_row.dart';
 import '../widgets/search_bar_widget.dart';
-import '../services/watch_history.dart';
 import 'detail_screen.dart';
+import 'downloads_screen.dart';
 import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -22,10 +25,8 @@ class _HomeScreenState extends State<HomeScreen> {
   int _tab = 0;
   bool _searching = false;
   List<WatchHistoryEntry> _continueWatching = WatchHistory.list();
+  final _searchCtrl = TextEditingController();
 
-  /// Re-reads watch history from Hive (cheap, local) - called whenever the
-  /// user could have changed it: returning from a player, or removing a
-  /// Continue Watching card.
   void _refreshContinueWatching() {
     if (!mounted) return;
     setState(() => _continueWatching = WatchHistory.list());
@@ -55,15 +56,15 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _continueWatching.remove(entry));
     await WatchHistory.remove(entry.tmdbId, entry.mediaType);
   }
-  final _searchCtrl = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    // Reload if data didn't come through from splash
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<TmdbProvider>();
-      if (provider.trending.isEmpty && provider.hindiMovies.isEmpty && !provider.loading) {
+      if (provider.trending.isEmpty &&
+          provider.hindiMovies.isEmpty &&
+          !provider.loading) {
         provider.loadHome();
       }
     });
@@ -98,24 +99,20 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<TmdbProvider>();
+    final downloads = context.watch<DownloadService>();
 
     return Scaffold(
       backgroundColor: const Color(0xFF050508),
       body: SafeArea(
         child: Column(
           children: [
-            // ── TOP BAR ──────────────────────────────────────────
             _buildTopBar(provider),
-
-            // ── CONTENT ──────────────────────────────────────────
             Expanded(
               child: _searching
                   ? _buildSearchResults(provider)
-                  : _buildMainContent(provider),
+                  : _buildMainContent(provider, downloads),
             ),
-
-            // ── BOTTOM NAV ────────────────────────────────────────
-            _buildBottomNav(),
+            _buildBottomNav(downloads),
           ],
         ),
       ),
@@ -134,7 +131,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       child: Row(
         children: [
-          // Logo
           if (!_searching) ...[
             Container(
               width: 36,
@@ -238,9 +234,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildMainContent(TmdbProvider provider) {
-    // Settings tab (the watchlist now lives inside Settings > Library).
-    if (_tab == 3) return const SettingsScreen();
+  Widget _buildMainContent(TmdbProvider provider, DownloadService downloads) {
+    // Dedicated permanent Downloads tab — works 100% offline.
+    if (_tab == 3) return const DownloadsScreen(embedded: true);
+    // Settings tab.
+    if (_tab == 4) return const SettingsScreen();
 
     if (provider.loading) {
       return const Center(
@@ -251,32 +249,66 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // Show error + retry if everything failed to load
-    if (provider.error != null && provider.trending.isEmpty && provider.hindiMovies.isEmpty) {
+    if (provider.error != null &&
+        provider.trending.isEmpty &&
+        provider.hindiMovies.isEmpty) {
       return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.wifi_off_rounded, color: Colors.white24, size: 56),
-            const SizedBox(height: 16),
-            const Text('Could not load content',
-                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 8),
-            Text(provider.error!,
-                style: const TextStyle(color: Colors.white38, fontSize: 11),
-                textAlign: TextAlign.center),
-            const SizedBox(height: 24),
-            ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFFCC00),
-                foregroundColor: Colors.black,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.wifi_off_rounded,
+                  color: Colors.white24, size: 56),
+              const SizedBox(height: 16),
+              const Text('Could not load content',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              Text(provider.error!,
+                  style: const TextStyle(color: Colors.white38, fontSize: 11),
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 24),
+              Wrap(
+                spacing: 12,
+                runSpacing: 10,
+                alignment: WrapAlignment.center,
+                children: [
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFFFCC00),
+                      foregroundColor: Colors.black,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12)),
+                    ),
+                    icon: const Icon(Icons.refresh_rounded),
+                    label: const Text('Retry',
+                        style: TextStyle(fontWeight: FontWeight.w800)),
+                    onPressed: () => provider.loadHome(),
+                  ),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white24),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12)),
+                    ),
+                    icon: const Icon(Icons.download_done_rounded,
+                        color: Color(0xFFFFCC00)),
+                    label: Text(
+                      downloads.completedCount > 0
+                          ? 'Open Downloads (${downloads.completedCount})'
+                          : 'Open Downloads',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    onPressed: () => setState(() => _tab = 3),
+                  ),
+                ],
               ),
-              icon: const Icon(Icons.refresh_rounded),
-              label: const Text('Retry', style: TextStyle(fontWeight: FontWeight.w800)),
-              onPressed: () => provider.loadHome(),
-            ),
-          ],
+            ],
+          ),
         ),
       );
     }
@@ -290,28 +322,19 @@ class _HomeScreenState extends State<HomeScreen> {
       child: ListView(
         padding: const EdgeInsets.only(bottom: 24),
         children: [
-          // Hero banner
           if (_tab == 0 && provider.trending.isNotEmpty)
             HeroBanner(
               items: provider.trending.take(5).toList(),
               onTap: _openDetail,
             ),
-
-          // Tab chips
           _buildTabChips(),
-
-          // Resume where you left off - real position, from watch_history.dart.
           if (_tab == 0)
             ContinueWatchingRow(
               items: _continueWatching,
               onTap: _resumeEntry,
               onRemove: _removeContinueWatching,
             ),
-
-          // Popular · Movie Channels - TMDB watch-provider rows.
           if (_tab == 0) ChannelRow(channels: provider.channels),
-
-          // Content rows
           ...rows.map((row) => MediaRow(
                 title: row.$1,
                 items: row.$2,
@@ -334,16 +357,32 @@ class _HomeScreenState extends State<HomeScreen> {
           ('📺 Hindi Web Series', p.hindiShows, const Color(0xFF3b82f6)),
           ('🆕 New Bollywood 2025', p.newBollywood, const Color(0xFF22c55e)),
           ('🎭 South Dubbed', p.southDubbed, const Color(0xFFe11d48)),
-          ('🌍 Hollywood Hindi Dubbed', p.hindiDubbedHollywood, const Color(0xFF8b5cf6)),
-          ('🎨 Animated Hindi Dubbed', p.hindiDubbedAnimated, const Color(0xFFec4899)),
+          (
+            '🌍 Hollywood Hindi Dubbed',
+            p.hindiDubbedHollywood,
+            const Color(0xFF8b5cf6)
+          ),
+          (
+            '🎨 Animated Hindi Dubbed',
+            p.hindiDubbedAnimated,
+            const Color(0xFFec4899)
+          ),
         ];
       case 1:
         return [
           ('🎬 Hindi Movies', p.hindiMovies, const Color(0xFFFFCC00)),
           ('🆕 New Bollywood 2025', p.newBollywood, const Color(0xFF22c55e)),
           ('🎭 South Dubbed', p.southDubbed, const Color(0xFFe11d48)),
-          ('🌍 Hollywood Hindi Dubbed', p.hindiDubbedHollywood, const Color(0xFF8b5cf6)),
-          ('🎨 Animated Hindi Dubbed', p.hindiDubbedAnimated, const Color(0xFFec4899)),
+          (
+            '🌍 Hollywood Hindi Dubbed',
+            p.hindiDubbedHollywood,
+            const Color(0xFF8b5cf6)
+          ),
+          (
+            '🎨 Animated Hindi Dubbed',
+            p.hindiDubbedAnimated,
+            const Color(0xFFec4899)
+          ),
         ];
       case 2:
         return [
@@ -394,21 +433,27 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildBottomNav() {
-    final items = [
+  Widget _buildBottomNav(DownloadService downloads) {
+    final navItems = [
       (Icons.home_rounded, 'Home'),
       (Icons.movie_rounded, 'Movies'),
       (Icons.tv_rounded, 'Shows'),
+      (Icons.download_for_offline_rounded, 'Downloads'),
       (Icons.settings_rounded, 'Settings'),
     ];
+    final activeCount = downloads.activeCount;
+
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF0A0A0F),
-        border: Border(top: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
+        border: Border(
+          top: BorderSide(color: Colors.white.withValues(alpha: 0.05)),
+        ),
       ),
       child: Row(
-        children: List.generate(items.length, (i) {
+        children: List.generate(navItems.length, (i) {
           final active = _tab == i;
+          final showBadge = i == 3 && activeCount > 0;
           return Expanded(
             child: GestureDetector(
               onTap: () => setState(() => _tab = i),
@@ -418,23 +463,47 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
-                      items[i].$1,
-                      color: active
-                          ? const Color(0xFFFFCC00)
-                          : Colors.white30,
-                      size: 22,
+                    Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Icon(
+                          navItems[i].$1,
+                          color: active
+                              ? const Color(0xFFFFCC00)
+                              : Colors.white30,
+                          size: 22,
+                        ),
+                        if (showBadge)
+                          Positioned(
+                            right: -6,
+                            top: -4,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 4.5, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFFFCC00),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                '$activeCount',
+                                style: const TextStyle(
+                                  color: Colors.black,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                     const SizedBox(height: 3),
                     Text(
-                      items[i].$2,
+                      navItems[i].$2,
                       style: TextStyle(
-                        color: active
-                            ? const Color(0xFFFFCC00)
-                            : Colors.white30,
+                        color:
+                            active ? const Color(0xFFFFCC00) : Colors.white30,
                         fontSize: 10,
-                        fontWeight:
-                            active ? FontWeight.w700 : FontWeight.w500,
+                        fontWeight: active ? FontWeight.w700 : FontWeight.w500,
                       ),
                     ),
                   ],
